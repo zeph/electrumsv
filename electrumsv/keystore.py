@@ -969,7 +969,7 @@ def instantiate_keystore(derivation_type: DerivationType, data: Dict[str, Any],
         parent_keystore: Optional[KeyStore]=None,
         row: Optional[MasterKeyRow]=None) -> KeyStore:
     keystore: KeyStore
-    if derivation_type == DerivationType.BIP32:
+    if derivation_type == DerivationType.BIP32 or derivation_type == DerivationType.BIP32_MNEE:
         keystore = BIP32_KeyStore(data, row, parent_keystore)
     elif derivation_type == DerivationType.HARDWARE:
         assert parent_keystore is None

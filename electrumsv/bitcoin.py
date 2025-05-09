@@ -110,6 +110,10 @@ def push_script(data_hex: str) -> str:
     return op_push(data_len) + bh2u(data)
 
 
+# Alias for legacy name
+push_item = push_script
+
+
 def is_new_seed(x, prefix=version.SEED_PREFIX):
     from . import mnemonic
     x = mnemonic.normalize_text(x)

@@ -39,6 +39,7 @@ import time
 from typing import (Any, cast, Dict, Iterable, List, NamedTuple, Optional, Sequence,
     Set, Tuple, TypeVar, TYPE_CHECKING, Union)
 import weakref
+import urllib.request
 
 import aiorpcx
 import attr
@@ -319,7 +320,7 @@ class AbstractAccount:
 
     def set_gap_limit_for_path(self, subpath: Sequence[int], limit: int) -> None:
         # TODO - this is an interim step towards persisting these settings via the
-        #  database and allowing for modification via the GUI preferences Accounts tab
+        # database and allowing for modification via the GUI preferences Accounts tab
         self._subpath_gap_limits[subpath] = limit
 
     def create_keys_until(self, derivation: Sequence[int],
@@ -870,19 +871,6 @@ class AbstractAccount:
         with self.transaction_lock:
             return self._process_key_usage(tx_hash, tx, relevant_txos)
 
-    # def _process_key_usage(self, tx_hash: bytes, tx: Transaction) -> None:
-    #     import cProfile, pstats, io
-    #     from pstats import SortKey
-    #     pr = cProfile.Profile()
-    #     pr.enable()
-    #     self._process_key_usage2(tx_hash, tx)
-    #     pr.disable()
-    #     s = io.StringIO()
-    #     sortby = SortKey.CUMULATIVE
-    #     ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-    #     ps.print_stats()
-    #     print(s.getvalue())
-
     def _process_key_usage(self, tx_hash: bytes, tx: Transaction,
             relevant_txos: Optional[List[Tuple[int, XTxOutput]]]) -> bool:
         tx_id = hash_to_hex_str(tx_hash)
@@ -951,13 +939,13 @@ class AbstractAccount:
 
         if len(tx_deltas):
             check_keyinstance_ids = set(r[1] for r in tx_deltas.keys())
+            # Create TransactionDeltaRow objects for each transaction delta
+            delta_rows = [ TransactionDeltaRow(k[0], k[1], v, None) for k, v in tx_deltas.items() ]
             self._wallet.create_or_update_transactiondelta_relative(
-                [ TransactionDeltaRow(k[0], k[1], v) for k, v in tx_deltas.items() ],
-                partial(self.requests.check_paid_requests, check_keyinstance_ids))
+                delta_rows, partial(self.requests.check_paid_requests, check_keyinstance_ids))
 
             affected_keys = [self._keyinstances[k] for (_x, k) in tx_deltas.keys()]
             self._wallet.trigger_callback('on_keys_updated', self._id, affected_keys)
-
             return True
 
         return False
@@ -2087,9 +2075,25 @@ class SimpleDeterministicAccount(SimpleAccount, DeterministicAccount):
 
 
 class StandardAccount(SimpleDeterministicAccount):
+    def __init__(self, wallet: 'Wallet', row: AccountRow,
+            keyinstance_rows: List[KeyInstanceRow],
+            output_rows: List[TransactionOutputRow]) -> None:
+        super().__init__(wallet, row, keyinstance_rows, output_rows)
+                
     def type(self) -> AccountType:
         return AccountType.STANDARD
-
+        
+    def get_keyinstance_for_txo(self, tx_hash: bytes) -> Optional[int]:
+        """Get the keyinstance_id that is associated with a transaction output."""
+        if hasattr(self, '_utxos'):
+            for utxo_key, utxo in self._utxos.items():
+                if utxo_key.tx_hash == tx_hash:
+                    return utxo.keyinstance_id
+        if hasattr(self, '_stxos'):
+            for stxo_key, keyinstance_id in self._stxos.items():
+                if stxo_key.tx_hash == tx_hash:
+                    return keyinstance_id
+        return None
 
 class MultisigAccount(DeterministicAccount):
     def __init__(self, wallet: 'Wallet', row: AccountRow,
@@ -2381,12 +2385,14 @@ class Wallet(TriggeredCallbacks):
     def _realize_account(self, account_row: AccountRow,
             keyinstance_rows: List[KeyInstanceRow],
             output_rows: List[TransactionOutputRow]) -> AbstractAccount:
+        from .mnee import MneeAccount
         account_constructors = {
             DerivationType.BIP32: StandardAccount,
             DerivationType.BIP32_SUBPATH: StandardAccount,
             DerivationType.ELECTRUM_OLD: StandardAccount,
             DerivationType.ELECTRUM_MULTISIG: MultisigAccount,
             DerivationType.HARDWARE: StandardAccount,
+            DerivationType.BIP32_MNEE: MneeAccount,  # Use MneeAccount for MNEE derivation type
         }
         if account_row.default_masterkey_id is None:
             if keyinstance_rows[0].derivation_type == DerivationType.PUBLIC_KEY_HASH:

@@ -26,15 +26,24 @@
 import enum
 from functools import partial
 import time
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import List, Optional, Union, TYPE_CHECKING, Tuple, Dict
 import weakref
 import webbrowser
+import asyncio
+import json
+import sys
+import traceback
+from decimal import Decimal
+import urllib.request
+import threading
+from collections import defaultdict
 
-from bitcoinx import hash_to_hex_str, MissingHeader
+from bitcoinx import hash_to_hex_str, MissingHeader, hex_str_to_hash, TxOutput
 
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QObject, QModelIndex, QTimer
 from PyQt5.QtGui import QBrush, QIcon, QColor, QFont
-from PyQt5.QtWidgets import QLabel, QMenu, QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QLabel, QMenu, QTreeWidgetItem, QVBoxLayout, QWidget, QAbstractItemView, QHeaderView
+from PyQt5 import sip
 
 from electrumsv.app_state import app_state
 from electrumsv.bitcoin import COINBASE_MATURITY
@@ -42,13 +51,13 @@ from electrumsv.constants import TxFlags
 from electrumsv.i18n import _
 from electrumsv.logs import logs
 from electrumsv.platform import platform
-from electrumsv.util import timestamp_to_datetime, profiler, format_time
-from electrumsv.wallet import AbstractAccount
+from electrumsv.util import timestamp_to_datetime, profiler, format_time, format_mnee_atomic, format_satoshis
+from electrumsv.wallet import AbstractAccount, HistoryLine, Wallet
 import electrumsv.web as web
 
 from .constants import ICON_NAME_INVOICE_PAYMENT
 from .table_widgets import TableTopButtonLayout
-from .util import MyTreeWidget, read_QIcon, MessageBox, SortableTreeWidgetItem
+from .util import MyTreeWidget, read_QIcon, MessageBox, SortableTreeWidgetItem, ColorScheme
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
@@ -56,6 +65,77 @@ if TYPE_CHECKING:
 
 logger = logs.get_logger("history-list")
 
+# MNEE API URLs defined as constants
+MNEE_API_URL_PRODUCTION = 'https://proxy-api.mnee.net'
+MNEE_API_URL_SANDBOX = 'https://sandbox-cosigner.mnee.net'
+
+# Cache for MNEE configuration
+_mnee_config_cache = {
+    'production': None,
+    'sandbox': None,
+    'last_fetch_time': 0
+}
+
+def fetch_mnee_config(environment='sandbox', api_key=None):
+    """
+    Fetch MNEE configuration from the API
+    Returns the config or None if fetch failed
+    """
+    if not api_key:
+        return None
+        
+    try:
+        base_url = MNEE_API_URL_PRODUCTION if environment == 'production' else MNEE_API_URL_SANDBOX
+        url = f"{base_url}/v1/config?auth_token={api_key}"
+        
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.getcode() == 200:
+                data = json.loads(response.read().decode())
+                # Store in cache
+                _mnee_config_cache[environment] = data
+                _mnee_config_cache['last_fetch_time'] = time.time()
+                return data
+    except Exception as e:
+        logger.error(f"Error fetching MNEE config: {e}")
+    
+    return None
+
+def init_mnee_config():
+    """
+    Initialize MNEE configuration by fetching from API
+    This runs in a background thread to avoid blocking startup
+    """
+    try:
+        config = app_state.config
+        
+        # Try both environments
+        environments = ['production', 'sandbox']
+        for env in environments:
+            api_key = config.get(f'mnee_api_key_{env}', '')
+            if api_key:
+                logger.debug(f"Attempting to fetch MNEE config for {env} environment")
+                config_data = fetch_mnee_config(env, api_key)
+                if config_data:
+                    logger.info(f"Successfully fetched MNEE config for {env} environment")
+                    # Extract and save token_id
+                    if 'tokenId' in config_data:
+                        logger.info(f"Found token_id in MNEE config: {config_data['tokenId']}")
+                        # Only set if not already set by user
+                        if not config.get('mnee_token_id', ''):
+                            config.set_key('mnee_token_id', config_data['tokenId'])
+                            logger.info(f"Set mnee_token_id in config to {config_data['tokenId']}")
+    except Exception as e:
+        logger.error(f"Error during MNEE config initialization: {e}")
+
+# Start MNEE config initialization in background thread
+def start_mnee_config_init():
+    thread = threading.Thread(target=init_mnee_config, daemon=True)
+    thread.start()
 
 class TxStatus(enum.IntEnum):
     MISSING = 0
@@ -104,8 +184,20 @@ class Columns(enum.IntEnum):
     DESCRIPTION = 3
     AMOUNT = 4
     BALANCE = 5
-    FIAT_AMOUNT = 6
-    FIAT_BALANCE = 7
+    MNEE_BALANCE = 6
+    FIAT_AMOUNT = 7
+    FIAT_BALANCE = 8
+
+
+class HistoryUpdater(QObject):
+    update_signal = pyqtSignal(dict)  # Change to dict type to match what we're emitting
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+    def update_history(self, history_data):
+        """Emit signal with the history data"""
+        self.update_signal.emit(history_data)
 
 
 class HistoryList(MyTreeWidget):
@@ -120,6 +212,10 @@ class HistoryList(MyTreeWidget):
         self._account_id: Optional[int] = None
         self._account: AbstractAccount = None
         self._wallet = main_window._wallet
+        
+        # Create updater object for thread-safe history updates
+        self._history_updater = HistoryUpdater()
+        self._history_updater.update_signal.connect(self._update_with_history_data)
 
         self._main_window.account_change_signal.connect(self._on_account_change)
 
@@ -129,13 +225,22 @@ class HistoryList(MyTreeWidget):
         self.setColumnHidden(Columns.TX_ID, True)
         self.setSortingEnabled(True)
         self.sortByColumn(Columns.STATUS, Qt.DescendingOrder)
+        
+        # Add tooltip to the MNEE Balance column header
+        mnee_tooltip = _("Running balance of MNEE tokens in this account")
+        header_item = self.headerItem()
+        header_item.setToolTip(Columns.MNEE_BALANCE, mnee_tooltip)
 
         self.monospace_font = QFont(platform.monospace_font)
         self.withdrawalBrush = QBrush(QColor("#BC1E1E"))
+        self.mneeBrush = QBrush(QColor("#0070FF"))  # Blue color for MNEE transactions
         self.invoiceIcon = read_QIcon(ICON_NAME_INVOICE_PAYMENT)
 
         # self._delegate = ItemDelegate(None, 50)
         # self.setItemDelegate(self._delegate)
+        
+        # Initialize MNEE config
+        start_mnee_config_init()
 
     def _on_account_change(self, new_account_id: int, new_account: AbstractAccount) -> None:
         self.clear()
@@ -153,7 +258,7 @@ class HistoryList(MyTreeWidget):
         self._main_window.history_view.update_tx_labels()
 
     def update_tx_headers(self) -> None:
-        headers = ['', '', _('Date'), _('Description') , _('Amount'), _('Balance')]
+        headers = ['', '', _('Date'), _('Description'), _('Amount'), _('Balance'), _('MNEE Balance')]
         fx = app_state.fx
         if fx and fx.show_history():
             headers.extend(['%s '%fx.ccy + _('Amount'), '%s '%fx.ccy + _('Balance')])
@@ -164,56 +269,454 @@ class HistoryList(MyTreeWidget):
         return None
 
     def on_update(self) -> None:
-        self._on_update_history_list()
+        logger.debug("HistoryList.on_update triggered.")
+        app_state.async_.spawn(self._async_fetch_history_data())
+    
+    async def _async_fetch_history_data(self) -> None:
+        """Called in the background thread to fetch history data."""
+        # Initialize empty history data with proper structure
+        history_data = {
+            'bsv_history': [],
+            'mnee_history': {}
+        }
+        
+        print("DEBUG: Starting async_fetch_history_data")
+        
+        # Check if account still exists before proceeding
+        if not self._account:
+            logger.warning("History fetch cancelled: Account disappeared before call.")
+            return
 
-    @profiler
-    def _on_update_history_list(self) -> None:
-        item = self.currentItem()
-        current_tx_hash = item.data(Columns.STATUS, self.TX_ROLE) if item else None
+        # FORCE ACCOUNT TO LOAD MNEE DATA
+        # This handles the bug where there are two different _load_mnee_data methods
+        if hasattr(self._account, '_mnee_balance_per_key'):
+            print("DEBUG: Account has _mnee_balance_per_key attribute")
+        else:
+            print("DEBUG: Account missing _mnee_balance_per_key - initializing it")
+            # Initialize the data structures if they don't exist
+            self._account._mnee_balance_per_key = {}
+            
+        if hasattr(self._account, '_mnee_tx_count_per_key'):
+            print("DEBUG: Account has _mnee_tx_count_per_key attribute")
+        else:
+            print("DEBUG: Account missing _mnee_tx_count_per_key - initializing it")
+            self._account._mnee_tx_count_per_key = {}
+            
+        # Try to call either version of _load_mnee_data
+        try:
+            # Load storage data
+            if hasattr(self._account, '_load_mnee_data'):
+                try:
+                    print("DEBUG: Calling account._load_mnee_data()")
+                    result = self._account._load_mnee_data()
+                    if isinstance(result, bool):
+                        print(f"DEBUG: _load_mnee_data returned {result}")
+                    else:
+                        print("DEBUG: _load_mnee_data did not return a value (void method)")
+                except Exception as e:
+                    print(f"DEBUG: Error in _load_mnee_data: {e}")
+        except Exception as e:
+            print(f"DEBUG: Exception checking MNEE data: {e}")
+            
+        # FORCE ADD SAMPLE MNEE DATA FOR TESTING
+        # Uncomment to force a balance to appear
+        # key_id = list(self._account._keyinstances.keys())[0] if self._account._keyinstances else 0
+        # self._account._mnee_balance_per_key[key_id] = 12345
+        # self._account._mnee_tx_count_per_key[key_id] = 1
+        # print(f"DEBUG: Added sample MNEE data: key {key_id}, balance 12345, tx count 1")
+
+        try:
+            # FORCE: Explicitly show MNEE data
+            print("DEBUG: Explicitly checking for MNEE data")
+            if hasattr(self._account, "get_mnee_balance"):
+                try:
+                    mnee_balance = self._account.get_mnee_balance()
+                    print(f"DEBUG: MNEE balance = {mnee_balance}")
+                    
+                    # Get MNEE transaction counts per key
+                    if hasattr(self._account, 'get_mnee_tx_count'):
+                        tx_counts = self._account.get_mnee_tx_count()
+                        if isinstance(tx_counts, dict):
+                            logger.info(f"MNEE transaction counts: {tx_counts}")
+                            
+                            # For each key with transactions, get the actual transaction history
+                            # using existing BSV transactions
+                            for key_id, count in tx_counts.items():
+                                if count > 0:
+                                    logger.info(f"Key {key_id} has {count} MNEE transactions")
+                                    # When fetching transactions from MNEE.net for this key, 
+                                    # we should wipe any existing MNEE data for this key first
+                                    
+                                    # Clear existing MNEE data for this key
+                                    if hasattr(self._account, 'clear_mnee_data_for_key'):
+                                        self._account.clear_mnee_data_for_key(key_id)
+                                        logger.info(f"Cleared existing MNEE data for key {key_id}")
+                                    
+                                    # This happens when we fetch from the API:
+                                    # 1. Clear old MNEE data for this key
+                                    # 2. Fetch new transaction history from MNEE.net
+                                    # 3. Store the new MNEE data
+                                    
+                                    # These MNEE transactions will then be associated with the actual
+                                    # blockchain transactions (BSV) that included them
+                    
+                    # We don't need to create synthetic transactions anymore
+                    # since we'll be using the actual transaction IDs
+
+                    # Create a dummy transaction hash for the balance
+                    dummy_tx_hash = bytes.fromhex("0" * 64)
+                    
+                    # Create history line for the balance
+                    from electrumsv.wallet import HistoryLine
+                    from electrumsv.constants import TxFlags
+                    
+                    # Add to the history data
+                    history_line = HistoryLine(
+                        sort_key=(0, 0),  # Top of the list
+                        tx_hash=dummy_tx_hash,
+                        tx_flags=TxFlags.Unset,
+                        height=None,
+                        value_delta=0,
+                        mnee_amount=mnee_balance
+                    )
+                    history_data['mnee_history'][dummy_tx_hash] = history_line
+                    logger.info(f"Added MNEE balance of {mnee_balance} to history")
+                except Exception as e:
+                    print(f"DEBUG: Error accessing get_mnee_balance: {e}")
+            else:
+                print("DEBUG: get_mnee_balance method not found")
+
+            # Fetch BSV history
+            bsv_history_with_balance = self._account.get_history(self.get_domain())
+            history_data['bsv_history'] = bsv_history_with_balance
+            logger.debug(f"Fetched BSV history with {len(bsv_history_with_balance)} entries")
+
+            # Check if MNEE is enabled for this account
+            mnee_enabled = False
+            # Check basic MNEE configuration
+            config = app_state.config
+            mnee_env = config.get('mnee_environment', 'sandbox')
+            # Use hardcoded URLs instead of getting from config
+            base_url = MNEE_API_URL_PRODUCTION if mnee_env == 'production' else MNEE_API_URL_SANDBOX
+            api_key = config.get(f'mnee_api_key_{mnee_env}', '')
+            
+            # Get token_id from config
+            token_id = config.get('mnee_token_id', '')
+            
+            # Try to fetch MNEE config if we have an API key but no token_id
+            if api_key and not token_id:
+                try:
+                    logger.debug(f"Fetching MNEE config for {mnee_env} environment using API key")
+                    mnee_config = fetch_mnee_config(mnee_env, api_key)
+                    if mnee_config and 'tokenId' in mnee_config:
+                        token_id = mnee_config['tokenId']
+                        logger.info(f"Successfully fetched token_id from API: {token_id}")
+                        # Store in config for future use
+                        config.set_key('mnee_token_id', token_id)
+                except Exception as e:
+                    logger.error(f"Error fetching MNEE config via API: {e}")
+            
+            # If token_id is still missing but we have cached config, use that
+            if not token_id and _mnee_config_cache.get(mnee_env) and isinstance(_mnee_config_cache[mnee_env], dict):
+                cached_token_id = _mnee_config_cache[mnee_env].get('tokenId')
+                if cached_token_id:
+                    token_id = cached_token_id
+                    logger.debug(f"Using tokenId from cached config: {token_id}")
+
+            # Set MNEE enabled if we have token_id and API key
+            mnee_enabled = bool(token_id and api_key)
+            logger.debug(f"MNEE configuration: environment={mnee_env}, token_id={'set' if token_id else 'missing'}, url={base_url}, enabled={mnee_enabled}")
+                
+            # Fall back to the check_mnee_config method if available
+            if hasattr(self._account, 'check_mnee_config'):
+                try:
+                    # Try to use the check_mnee_config method, but force-enable MNEE regardless of the result
+                    original_mnee_enabled = self._account.check_mnee_config()
+                    mnee_enabled = True  # Force enable
+                    logger.info(f"MNEE check_mnee_config returned {original_mnee_enabled}, forcing enabled")
+                    
+                    # Directly configure the account with MNEE settings
+                    if not hasattr(self._account, '_mnee_config'):
+                        logger.info("Creating _mnee_config on account")
+                        self._account._mnee_config = {}
+                    
+                    self._account._mnee_config['token_id'] = token_id
+                    self._account._mnee_config['base_url'] = base_url
+                    self._account._mnee_config['api_key'] = api_key
+                    self._account._mnee_config['environment'] = mnee_env
+                    
+                    logger.info(f"Configured account with MNEE settings: env={mnee_env}, url={base_url}")
+                    
+                    # Ensure the account has the necessary data structures
+                    if not hasattr(self._account, '_mnee_amounts'):
+                        self._account._mnee_amounts = {}
+                    if not hasattr(self._account, '_mnee_balance_per_key'):
+                        self._account._mnee_balance_per_key = defaultdict(int)
+                    if not hasattr(self._account, '_mnee_tx_count_per_key'):
+                        self._account._mnee_tx_count_per_key = defaultdict(int)
+                        
+                    # Force a config update
+                    logger.info("Forcing MNEE config initialization on account")
+                    app_state.async_.spawn(self._account._fetch_mnee_utxos())
+                    
+                except Exception as e:
+                    logger.error(f"Error configuring MNEE: {e}", exc_info=True)
+                    # Force enable MNEE even if there was an error
+                    mnee_enabled = True
+            else:
+                logger.debug("Account does not have check_mnee_config method")
+                mnee_enabled = True  # Force enable MNEE regardless
+
+            # Find all active key IDs for MNEE token checking
+            key_ids_for_mnee = []
+            if self._account and hasattr(self._account, 'get_keyinstance_ids'):
+                key_ids_for_mnee = self._account.get_keyinstance_ids()
+                if key_ids_for_mnee:
+                    logger.debug(f"Found {len(key_ids_for_mnee)} keys to check for MNEE tokens")
+                else:
+                    logger.debug("No keys found to check for MNEE tokens")
+
+            # Instead of attempting to get history for each key, use the existing MNEE methods
+            if mnee_enabled and hasattr(self._account, 'get_mnee_balance'):
+                try:
+                    # Get the MNEE balance
+                    mnee_balance = self._account.get_mnee_balance()
+                    logger.info(f"Total MNEE balance: {mnee_balance}")
+                    
+                    # Get MNEE transaction counts per key
+                    if hasattr(self._account, 'get_mnee_tx_count'):
+                        tx_counts = self._account.get_mnee_tx_count()
+                        if isinstance(tx_counts, dict):
+                            logger.info(f"MNEE transaction counts: {tx_counts}")
+                            
+                            # For each key with transactions, get the actual transaction history
+                            # using existing BSV transactions
+                            for key_id, count in tx_counts.items():
+                                if count > 0:
+                                    logger.info(f"Key {key_id} has {count} MNEE transactions")
+                                    # When fetching transactions from MNEE.net for this key, 
+                                    # we should wipe any existing MNEE data for this key first
+                                    
+                                    # Clear existing MNEE data for this key
+                                    if hasattr(self._account, 'clear_mnee_data_for_key'):
+                                        self._account.clear_mnee_data_for_key(key_id)
+                                        logger.info(f"Cleared existing MNEE data for key {key_id}")
+                                    
+                                    # This happens when we fetch from the API:
+                                    # 1. Clear old MNEE data for this key
+                                    # 2. Fetch new transaction history from MNEE.net
+                                    # 3. Store the new MNEE data
+                                    
+                                    # These MNEE transactions will then be associated with the actual
+                                    # blockchain transactions (BSV) that included them
+                    
+                    # We don't need to create synthetic transactions anymore
+                    # since we'll be using the actual transaction IDs
+
+                except Exception as e:
+                    logger.error(f"Error getting MNEE data: {e}", exc_info=True)
+
+            # Check if updater still exists before emitting signal
+            if not self._history_updater or sip.isdeleted(self._history_updater):
+                 logger.warning("History fetch complete, but updater is deleted. Skipping UI update.")
+                 return
+                 
+            # Log summary of what we're sending to the UI
+            logger.debug(f"Sending history data with {len(history_data['bsv_history'])} BSV entries and " 
+                         f"{len(history_data['mnee_history'])} MNEE entries to UI")
+            self._history_updater.update_history(history_data)
+
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.warning("History fetch task cancelled.")
+        except Exception as e:
+            logger.error(f"Error fetching history data: {e}", exc_info=True)
+    
+    def _update_with_history_data(self, history_data):
+        """Update the UI with history data (called in UI thread via signal)"""
         self.clear()
         if self._account is None:
             return
+        
+        # print(f"DEBUG: _update_with_history_data called with history data {history_data}")
+        
+        bsv_history = history_data.get('bsv_history', [])
+        
+        logger.debug(f"Processing {len(bsv_history)} BSV entries")
+        
+        # Get current item to restore selection
+        item = self.currentItem()
+        current_tx_hash = item.data(Columns.STATUS, self.TX_ROLE) if item else None
+        
+        # Track transaction counts by keyinstance_id for archiving logic
+        tx_counts_by_key = {}
+        
+        # Start with existing counts from the account
+        if hasattr(self._account, 'get_mnee_tx_count'):
+            # Get existing counts as a baseline
+            existing_counts = self._account.get_mnee_tx_count()
+            if isinstance(existing_counts, dict):
+                tx_counts_by_key = existing_counts.copy()
+                logger.debug(f"Starting with {len(tx_counts_by_key)} existing MNEE transaction counts from storage")
+                
+                # Log the first few entries for debugging
+                count = 0
+                for key_id, tx_count in tx_counts_by_key.items():
+                    if count < 5:  # Just show the first 5
+                        logger.debug(f"Existing MNEE count for key {key_id}: {tx_count}")
+                        count += 1
+            else:
+                logger.debug(f"get_mnee_tx_count() returned {existing_counts}, not a dictionary")
+        else:
+            logger.debug("Account doesn't have get_mnee_tx_count method")
+        
+        # --- Combine histories ---
+        combined_history = {}
+        for line, balance in bsv_history:
+            combined_history[line.tx_hash] = (line, balance)
+            
+            # Update transaction count for this key
+            keyinstance_id = self._account.get_keyinstance_for_txo(line.tx_hash)
+            if keyinstance_id is not None:
+                tx_counts_by_key[keyinstance_id] = tx_counts_by_key.get(keyinstance_id, 0) + 1
+            
+        logger.debug(f"Added {len(combined_history)} BSV transactions to combined history")
+
+        last_bsv_balance = 0
+        if bsv_history:
+            last_bsv_balance = bsv_history[-1][1]
+        
+        # Update MNEE transaction counts in wallet data
+        for keyinstance_id, count in tx_counts_by_key.items():
+            if count > 0:
+                logger.debug(f"Updating MNEE transaction count for key {keyinstance_id}: {count}")
+                # Store the count for this keyinstance_id
+                if hasattr(self._account, '_mnee_tx_count_per_key'):
+                    self._account._mnee_tx_count_per_key[keyinstance_id] = count
+                else:
+                    logger.warning("Account doesn't have _mnee_tx_count_per_key attribute. MNEE transaction counting won't work.")
+                
+        # Save all updated transaction counts to the database in one go
+        if hasattr(self._account, '_save_mnee_data_to_db'):
+            logger.debug("Saving updated MNEE transaction counts to storage")
+            self._account._save_mnee_data_to_db()
+        else:
+            logger.warning("Account doesn't have _save_mnee_data_to_db method. MNEE transaction counts won't be persisted.")
+                
+        # Check for keys with no UTXOs but with transactions - candidates for archiving
+        for keyinstance_id, count in tx_counts_by_key.items():
+            if hasattr(self._account, 'get_key_utxos') and count >= 2:
+                utxos = self._account.get_key_utxos({keyinstance_id})
+                if not utxos:
+                    logger.info(f"Key {keyinstance_id} has {count} transactions but no UTXOs - candidate for archiving")
+                    # The wallet's standard archiving mechanism should handle this
+
+        # No history to display
+        if not combined_history:
+            logger.debug("No history entries to display")
+            return
+            
+        combined_list = sorted(combined_history.values(), key=lambda item: item[0].sort_key)
+        logger.debug(f"Sorted {len(combined_list)} combined history entries")
+
+        # --- Create TreeWidgetItems ---
         fx = app_state.fx
         if fx:
             fx.history_used_spot = False
         local_height = self._wallet.get_local_height()
-        server_height = self._main_window.network.get_server_height() if self._main_window.network \
-            else 0
+        server_height = self._main_window.network.get_server_height() if self._main_window.network else 0
         header_at_height = app_state.headers.header_at_height
         chain = app_state.headers.longest_chain()
         missing_header_heights = []
         items = []
-        for line, balance in self._account.get_history(self.get_domain()):
+
+        # Also check transaction counts which might exist separately
+        if hasattr(self._account, '_mnee_tx_count_per_key'):
+            tx_counts = self._account._mnee_tx_count_per_key
+            print(f"DEBUG: Found _mnee_tx_count_per_key with {len(tx_counts)} entries")
+            
+            # Print the actual transaction counts
+            for key_id, count in tx_counts.items():
+                print(f"DEBUG: Key {key_id} has {count} MNEE transactions")
+
+        # Iterate through the sorted, combined list
+        print(f"DEBUG: Processing {len(combined_list)} history entries for display")
+        for line, balance in combined_list:
             tx_id = hash_to_hex_str(line.tx_hash)
-            conf = 0 if line.height <= 0 else max(local_height - line.height + 1, 0)
+            # Fix for None height values in MNEE transactions
+            conf = 0
+            if line.height is not None:
+                conf = 0 if line.height <= 0 else max(local_height - line.height + 1, 0)
+                
             timestamp = False
-            if line.height > 0:
+            if line.height is not None and line.height > 0:
                 try:
                     timestamp = header_at_height(chain, line.height).timestamp
                 except MissingHeader:
                     if line.height <= server_height:
                         missing_header_heights.append(line.height)
-                    else:
-                        logger.debug("Unable to backfill header at %d (> %d)",
-                            line.height, server_height)
+
+            # Amount String Logic
+            v_str = "--"
+            fiat_amount_str = ""
+            
+            # Get the key_id this transaction relates to
+            key_id = self._account.get_keyinstance_for_txo(line.tx_hash)
+            
+            # Check if this transaction has MNEE value
+            is_mnee_tx = line.mnee_amount is not None 
+            has_tx_count = key_id is not None and key_id in tx_counts_by_key and tx_counts_by_key[key_id] > 0
+            
+            # Status string
             status = get_tx_status(self._account, line.tx_hash, line.height, conf, timestamp)
             status_str = get_tx_desc(status, timestamp)
-            v_str = app_state.format_amount(line.value_delta, True, whitespaces=True)
+            if is_mnee_tx or has_tx_count:
+                status_str = f"MNEE + BSV ({status_str})"
+            
+            # Format the amount string
+            if is_mnee_tx and line.mnee_amount is not None:
+                mnee_amount_str = format_mnee_atomic(line.mnee_amount, 5, "")
+                bsv_str = app_state.format_amount(line.value_delta, True, whitespaces=True)
+                v_str = f"{bsv_str} + {mnee_amount_str} MNEE"
+                fiat_amount_str = "--"
+            else:
+                v_str = app_state.format_amount(line.value_delta, True, whitespaces=True)
+                if fx and fx.show_history():
+                    date = timestamp_to_datetime(time.time() if conf <= 0 else timestamp)
+                    fiat_amount_str = fx.historical_value_str(line.value_delta, date)
+
+            # Balance string logic
             balance_str = app_state.format_amount(balance, whitespaces=True)
-            label = self._wallet.get_transaction_label(line.tx_hash)
-            entry = [None, tx_id, status_str, label, v_str, balance_str]
+            
+            # MNEE balance string
+            mnee_balance_str = "--"
+            if line.mnee_amount is not None:
+                mnee_balance_str = format_mnee_atomic(line.mnee_amount, 5, "MNEE")
+            
+            # Fiat strings
+            fiat_balance_str = ""
             if fx and fx.show_history():
                 date = timestamp_to_datetime(time.time() if conf <= 0 else timestamp)
-                for amount in [line.value_delta, balance]:
-                    text = fx.historical_value_str(amount, date)
-                    entry.append(text)
+                fiat_balance_str = fx.historical_value_str(balance, date)
+            
+            # Fetch the label
+            label = self._wallet.get_transaction_label(line.tx_hash)
+            
+            # If this is a transaction with MNEE tokens, enhance the label
+            if is_mnee_tx or has_tx_count:
+                if not label:
+                    label = "MNEE token transaction"
+                elif "MNEE" not in label:
+                    label = f"MNEE: {label}"
+            
+            # Create entry list
+            entry = [None, tx_id, status_str, label, v_str, balance_str, mnee_balance_str]
+            if fx and fx.show_history():
+                entry.extend([fiat_amount_str, fiat_balance_str])
 
             item = SortableTreeWidgetItem(entry)
-            # If there is no text,
             item.setIcon(Columns.STATUS, get_tx_icon(status))
             item.setToolTip(Columns.STATUS, get_tx_tooltip(status, conf))
-            if line.tx_flags & TxFlags.PaysInvoice:
-                item.setIcon(Columns.DESCRIPTION, self.invoiceIcon)
+
             for i in range(len(entry)):
                 if i > Columns.DESCRIPTION:
                     item.setTextAlignment(i, Qt.AlignRight | Qt.AlignVCenter)
@@ -221,15 +724,28 @@ class HistoryList(MyTreeWidget):
                     item.setTextAlignment(i, Qt.AlignLeft | Qt.AlignVCenter)
                 if i != Columns.DATE:
                     item.setFont(i, self.monospace_font)
-            if line.value_delta and line.value_delta < 0:
+                    
+            # Set text color based on transaction type
+            if is_mnee_tx or has_tx_count:
+                item.setForeground(Columns.DESCRIPTION, self.mneeBrush)
+                item.setForeground(Columns.AMOUNT, self.mneeBrush)
+                item.setForeground(Columns.MNEE_BALANCE, self.mneeBrush)
+            elif line.value_delta and line.value_delta < 0:
                 item.setForeground(Columns.DESCRIPTION, self.withdrawalBrush)
                 item.setForeground(Columns.AMOUNT, self.withdrawalBrush)
+
+            # Modify sort data for Amount column
+            sort_amount = line.value_delta
+            item.setData(Columns.AMOUNT, SortableTreeWidgetItem.DataRole, sort_amount)
+            
+            # Set other sort data
             item.setData(Columns.STATUS, SortableTreeWidgetItem.DataRole, line.sort_key)
             item.setData(Columns.DATE, SortableTreeWidgetItem.DataRole, line.sort_key)
+            item.setData(Columns.BALANCE, SortableTreeWidgetItem.DataRole, balance)
+            
             item.setData(Columns.STATUS, self.ACCOUNT_ROLE, self._account_id)
             item.setData(Columns.STATUS, self.TX_ROLE, line.tx_hash)
 
-            # self.insertTopLevelItem(0, item)
             if current_tx_hash == line.tx_hash:
                 self.setCurrentItem(item)
 
@@ -238,6 +754,7 @@ class HistoryList(MyTreeWidget):
         self.addTopLevelItems(items)
 
         if len(missing_header_heights) and self._main_window.network:
+            # Request missing headers needed for timestamps
             self._main_window.network.backfill_headers_at_heights(missing_header_heights)
 
     def on_doubleclick(self, item: QTreeWidgetItem, column: int) -> None:

@@ -34,11 +34,17 @@ from .main_window import ElectrumWindow
 from .util import WindowModalDialog, ButtonsLineEdit, ColorScheme, Buttons, CloseButton
 from .history_list import HistoryList
 from .qrtextedit import ShowQRTextEdit
+from electrumsv.logs import logs
+
+logger = logs.get_logger("address-dialog")
 
 
 class KeyDialog(WindowModalDialog):
     def __init__(self, main_window: ElectrumWindow, account_id: int, key_id: int) -> None:
+        logger.debug("KeyDialog: Initializing...")
+        
         WindowModalDialog.__init__(self, main_window, _("Key"))
+        
         self._account_id = account_id
         self._key_id = key_id
         self._main_window = main_window
@@ -81,7 +87,9 @@ class KeyDialog(WindowModalDialog):
         vbox.addWidget(self._history_list)
 
         vbox.addLayout(Buttons(CloseButton(self)))
+        logger.debug("KeyDialog: Calling history_list.update()")
         self._history_list.update()
+        logger.debug("KeyDialog: Finished history_list.update()")
 
         # connect slots so the embedded history list gets updated whenever the history changes
         main_window.history_updated_signal.connect(self._history_list.update)

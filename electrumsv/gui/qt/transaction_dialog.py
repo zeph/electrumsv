@@ -36,7 +36,7 @@ import weakref
 import webbrowser
 
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QBrush, QCursor, QFont
+from PyQt5.QtGui import QBrush, QCursor, QFont, QColor
 from PyQt5.QtWidgets import (QDialog, QLabel, QMenu, QPushButton, QHBoxLayout,
     QToolTip, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -85,6 +85,7 @@ class InputColumns(enum.IntEnum):
     ACCOUNT = 1
     SOURCE = 2
     AMOUNT = 3
+    MNEE_AMOUNT = 4  # New column for MNEE amount
 
 
 class OutputColumns(enum.IntEnum):
@@ -92,6 +93,7 @@ class OutputColumns(enum.IntEnum):
     ACCOUNT = 1
     DESTINATION = 2
     AMOUNT = 3
+    MNEE_AMOUNT = 4  # New column for MNEE amount
 
 
 class Roles(enum.IntEnum):
@@ -545,16 +547,20 @@ class TxDialog(QDialog, MessageBoxMixin):
         self._o_table = OutputTreeWidget(self, self._main_window)
 
         self._spent_value_label = QLabel()
+        self._spent_mnee_label = QLabel()  # Add MNEE spent label
         input_header_layout = QHBoxLayout()
         input_header_layout.addWidget(QLabel(_("Inputs") + ' (%d)' % len(self.tx.inputs)))
         input_header_layout.addStretch(1)
         input_header_layout.addWidget(self._spent_value_label)
+        input_header_layout.addWidget(self._spent_mnee_label)  # Add MNEE label to layout
 
         self._received_value_label = QLabel()
+        self._received_mnee_label = QLabel()  # Add MNEE received label
         output_header_layout = QHBoxLayout()
         output_header_layout.addWidget(QLabel(_("Outputs") + ' (%d)' % len(self.tx.outputs)))
         output_header_layout.addStretch(1)
         output_header_layout.addWidget(self._received_value_label)
+        output_header_layout.addWidget(self._received_mnee_label)  # Add MNEE label to layout
 
         vbox.addLayout(input_header_layout)
         vbox.addWidget(self._i_table)
@@ -594,6 +600,24 @@ class TxDialog(QDialog, MessageBoxMixin):
             name = account.display_name()
             return f"{account.get_id()}: {name}"
 
+        # Function to get MNEE amount for a transaction output if available
+        def get_mnee_amount_for_tx(account: AbstractAccount, tx_hash: bytes, output_index: int = None) -> Optional[int]:
+            if not account or not hasattr(account, 'get_keyinstance_for_txo'):
+                return None
+            
+            try:
+                # Get the keyinstance_id associated with this transaction
+                keyinstance_id = account.get_keyinstance_for_txo(tx_hash)
+                
+                # If there's a matching key and it has MNEE data, return the amount
+                if keyinstance_id is not None and hasattr(account, '_mnee_balance_per_key'):
+                    mnee_amount = account._mnee_balance_per_key.get(keyinstance_id)
+                    return mnee_amount
+            except Exception as e:
+                logger.error(f"Error getting MNEE amount: {e}")
+            
+            return None
+
         is_tx_complete = self.tx.is_complete()
         is_tx_known = self._account and self._account.have_transaction_data(self._tx_hash)
 
@@ -603,10 +627,14 @@ class TxDialog(QDialog, MessageBoxMixin):
         self._spent_value_label.setText(_("Spent input value") +": "+
             app_state.format_amount(sum(r.value for r in prev_txos)))
 
+        # Track MNEE spent amount
+        spent_mnee_amount = 0
+        
         for tx_index, txin in enumerate(self.tx.inputs):
             account_name = ""
             source_text = ""
             amount_text = ""
+            mnee_amount_text = ""  # Initialize MNEE amount text
             is_receiving = is_change = is_broken = False
             txo_key = TxoKeyType(txin.prev_hash, txin.prev_idx)
 
@@ -618,6 +646,10 @@ class TxDialog(QDialog, MessageBoxMixin):
                 # There are only certain kinds of transactions that have values on the inputs,
                 # likely deserialised incomplete transactions from cosigners. Others?
                 value = txin.value
+                
+                # Try to get MNEE amount for this input
+                mnee_amount = None
+                
                 if self._account is not None:
                     keyinstance_id = get_keyinstance_id(self._account, txo_key)
                     is_receiving = compare_key_path(self._account, keyinstance_id,
@@ -634,9 +666,18 @@ class TxDialog(QDialog, MessageBoxMixin):
                             # The transaction was most likely loaded from external source and is
                             # being viewed but has not been added to the account.
                             is_broken = (prev_txo.flags & TransactionOutputFlag.IS_SPENT) != 0
+                            
+                    # Try to get MNEE amount for this input
+                    mnee_amount = get_mnee_amount_for_tx(self._account, txin.prev_hash, txin.prev_idx)
+                    if mnee_amount is not None:
+                        mnee_amount_text = format_mnee_atomic(mnee_amount)
+                        spent_mnee_amount += mnee_amount
+                        
                 amount_text = app_state.format_amount(value, whitespaces=True)
 
-            item = QTreeWidgetItem([ str(tx_index), account_name, source_text, amount_text ])
+            item = QTreeWidgetItem([
+                str(tx_index), account_name, source_text, amount_text, mnee_amount_text
+            ])
             item.setData(InputColumns.INDEX, Roles.TX_HASH, txin.prev_hash)
             item.setData(InputColumns.INDEX, Roles.IS_MINE, is_change or is_receiving)
             if is_receiving:
@@ -647,6 +688,14 @@ class TxDialog(QDialog, MessageBoxMixin):
                 item.setBackground(InputColumns.SOURCE, self._broken_brush)
             item.setTextAlignment(InputColumns.AMOUNT, Qt.AlignRight | Qt.AlignVCenter)
             item.setFont(InputColumns.AMOUNT, self._monospace_font)
+            
+            # Set alignment and font for MNEE amount column
+            if mnee_amount_text:
+                item.setTextAlignment(InputColumns.MNEE_AMOUNT, Qt.AlignRight | Qt.AlignVCenter)
+                item.setFont(InputColumns.MNEE_AMOUNT, self._monospace_font)
+                # Highlight MNEE entries with blue color
+                item.setForeground(InputColumns.MNEE_AMOUNT, QBrush(QColor("#0070FF")))
+                
             i_table.addTopLevelItem(item)
 
         # TODO: Rewrite this to be lot simpler when we have better TXO management. At this time
@@ -656,6 +705,8 @@ class TxDialog(QDialog, MessageBoxMixin):
         # identified and colourised.
 
         received_value = 0
+        received_mnee = 0  # Track MNEE received amount
+        
         for tx_index, tx_output in enumerate(self.tx.outputs):
             text, _kind = tx_output_to_display_text(tx_output)
             if isinstance(_kind, Unknown_Output):
@@ -676,6 +727,10 @@ class TxDialog(QDialog, MessageBoxMixin):
             keyinstance_id: Optional[int] = None
             is_receiving = is_change = False
             txo_key = TxoKeyType(self._tx_hash, tx_index)
+            
+            mnee_amount = None  # Initialize MNEE amount
+            mnee_amount_text = ""  # Text representation of MNEE amount
+            
             for account in accounts:
                 if is_tx_complete:
                     keyinstance_id = get_keyinstance_id(account, txo_key)
@@ -688,11 +743,20 @@ class TxDialog(QDialog, MessageBoxMixin):
                     is_change = compare_key_path(account, keyinstance_id, CHANGE_SUBPATH)
                     account_name = name_for_account(account)
                     received_value += tx_output.value
+                    
+                    # Try to get MNEE amount for this output
+                    mnee_amount = get_mnee_amount_for_tx(account, self._tx_hash)
+                    if mnee_amount is not None:
+                        mnee_amount_text = format_mnee_atomic(mnee_amount)
+                        received_mnee += mnee_amount
+                        
                     break
 
             amount_text = app_state.format_amount(tx_output.value, whitespaces=True)
 
-            item = QTreeWidgetItem([ str(tx_index), account_name, text, amount_text ])
+            item = QTreeWidgetItem([
+                str(tx_index), account_name, text, amount_text, mnee_amount_text
+            ])
             item.setData(OutputColumns.INDEX, Roles.IS_MINE, is_change or is_receiving)
             item.setData(OutputColumns.INDEX, Roles.ACCOUNT_ID, account_id)
             item.setData(OutputColumns.INDEX, Roles.KEY_ID, keyinstance_id)
@@ -702,10 +766,28 @@ class TxDialog(QDialog, MessageBoxMixin):
                 item.setBackground(OutputColumns.DESTINATION, self._change_brush)
             item.setTextAlignment(OutputColumns.AMOUNT, Qt.AlignRight | Qt.AlignVCenter)
             item.setFont(OutputColumns.AMOUNT, self._monospace_font)
+            
+            # Set alignment and font for MNEE amount column
+            if mnee_amount_text:
+                item.setTextAlignment(OutputColumns.MNEE_AMOUNT, Qt.AlignRight | Qt.AlignVCenter)
+                item.setFont(OutputColumns.MNEE_AMOUNT, self._monospace_font)
+                # Highlight MNEE entries with blue color
+                item.setForeground(OutputColumns.MNEE_AMOUNT, QBrush(QColor("#0070FF")))
+                
             o_table.addTopLevelItem(item)
 
         self._received_value_label.setText(_("Received output value") +": "+
             app_state.format_amount(received_value))
+        
+        # Update MNEE labels
+        if spent_mnee_amount > 0 or received_mnee > 0:
+            self._spent_mnee_label.setText(_("MNEE spent") +": "+
+                format_mnee_atomic(spent_mnee_amount))
+            self._received_mnee_label.setText(_("MNEE received") +": "+
+                format_mnee_atomic(received_mnee))
+        else:
+            self._spent_mnee_label.setText("")
+            self._received_mnee_label.setText("")
 
     # Only called from the history ui dialog.
     def _get_tx_info(self, tx: Transaction) -> TxInfo:
@@ -801,7 +883,7 @@ class TxDialog(QDialog, MessageBoxMixin):
 class InputTreeWidget(MyTreeWidget):
     def __init__(self, parent: QWidget, main_window: 'ElectrumWindow') -> None:
         MyTreeWidget.__init__(self, parent, main_window, self._create_menu,
-            [ _("Index"), _("Account"), _("Source"), _("Amount") ], InputColumns.SOURCE, [])
+            [ _("Index"), _("Account"), _("Source"), _("Amount"), _("MNEE Amount") ], InputColumns.SOURCE, [])
 
     def on_doubleclick(self, item: QTreeWidgetItem, column: int) -> None:
         if self.permit_edit(item, column):
@@ -854,7 +936,7 @@ class InputTreeWidget(MyTreeWidget):
 class OutputTreeWidget(MyTreeWidget):
     def __init__(self, parent: QWidget, main_window: 'ElectrumWindow') -> None:
         MyTreeWidget.__init__(self, parent, main_window, self._create_menu,
-            [ _("Index"), _("Account"), _("Destination"), _("Amount") ],
+            [ _("Index"), _("Account"), _("Destination"), _("Amount"), _("MNEE Amount") ],
             OutputColumns.DESTINATION, [])
 
     def on_doubleclick(self, item: QTreeWidgetItem, column: int) -> None:

@@ -88,7 +88,7 @@ def read_rows_by_id(return_type: Type[T], db: sqlite3.Connection, sql: str, para
         cursor.close()
         results.extend(rows)
         ids = ids[batch_size:]
-    return [ return_type(*t) for t in results ]
+    return results
 
 
 class BaseWalletStore:
@@ -846,6 +846,7 @@ class TransactionDeltaRow(NamedTuple):
     tx_hash: bytes
     keyinstance_id: int
     value_delta: int
+    mnee_delta: Optional[int] = None
 
 class TransactionKeyHistoryRow(NamedTuple):
     tx_hash: bytes
@@ -855,6 +856,7 @@ class TransactionDeltaHistoryRow(NamedTuple):
     tx_hash: bytes
     tx_flags: TxFlags
     value_delta: int
+    mnee_delta: Optional[int] = None
 
 class TransactionDeltaKeySummaryRow(NamedTuple):
     keyinstance_id: int
@@ -866,14 +868,15 @@ class TransactionDeltaKeySummaryRow(NamedTuple):
     date_updated: int
     total_value: int
     match_count: int
+    mnee_balance: int
 
 
 class TransactionDeltaTable(BaseWalletStore):
     LOGGER_NAME = "db-table-txdelta"
 
     CREATE_SQL_BASE = ("INTO TransactionDeltas "
-        "(tx_hash, keyinstance_id, value_delta, date_created, date_updated) "
-        "VALUES (?, ?, ?, ?, ?)")
+        "(tx_hash, keyinstance_id, value_delta, mnee_delta, date_created, date_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?)")
     CREATE_SQL = "INSERT "+ CREATE_SQL_BASE
     CREATE_OR_IGNORE_SQL = "INSERT OR IGNORE "+ CREATE_SQL_BASE
     READ_SQL = ("SELECT KI.account_id, TOTAL(TD.value_delta), COUNT(TD.value_delta) "
@@ -900,13 +903,13 @@ class TransactionDeltaTable(BaseWalletStore):
         "INNER JOIN Transactions AS T ON TD.tx_hash = T.tx_hash "
         "WHERE T.description IS NOT NULL "
         "GROUP BY T.tx_hash")
-    READ_HISTORY_SQL = ("SELECT T.tx_hash, T.flags, TOTAL(TD.value_delta) "
+    READ_HISTORY_SQL = ("SELECT T.tx_hash, T.flags, TOTAL(TD.value_delta), TOTAL(TD.mnee_delta) "
         "FROM Transactions T "
         "INNER JOIN TransactionDeltas AS TD ON T.tx_hash = TD.tx_hash "
         "INNER JOIN KeyInstances AS KI ON TD.keyinstance_id = KI.keyinstance_id AND "
             "KI.account_id = ? "
         "GROUP BY T.tx_hash")
-    READ_HISTORY_DOMAIN_SQL = ("SELECT T.tx_hash, T.flags, TOTAL(TD.value_delta) "
+    READ_HISTORY_DOMAIN_SQL = ("SELECT T.tx_hash, T.flags, TOTAL(TD.value_delta), TOTAL(TD.mnee_delta) "
         "FROM Transactions T "
         "INNER JOIN TransactionDeltas AS TD ON T.tx_hash = TD.tx_hash "
         "INNER JOIN KeyInstances AS KI ON TD.keyinstance_id = KI.keyinstance_id AND "
@@ -914,14 +917,14 @@ class TransactionDeltaTable(BaseWalletStore):
         "GROUP BY T.tx_hash")
     READ_KEY_SUMMARY_SQL = ("SELECT KI.keyinstance_id, KI.masterkey_id, KI.derivation_type, "
             "KI.derivation_data, KI.script_type, KI.flags, KI.date_updated, "
-            "TOTAL(TD.value_delta), COUNT(TD.value_delta) "
+            "TOTAL(TD.value_delta), COUNT(DISTINCT TD.tx_hash), TOTAL(TD.mnee_delta) "
         "FROM KeyInstances AS KI "
         "LEFT JOIN TransactionDeltas TD ON TD.keyinstance_id = KI.keyinstance_id "
         "WHERE KI.account_id = ? "
         "GROUP BY KI.keyinstance_id")
     READ_KEY_SUMMARY_DOMAIN_SQL = ("SELECT KI.keyinstance_id, KI.masterkey_id, KI.derivation_type, "
             "KI.derivation_data, KI.script_type, KI.flags, KI.date_updated, "
-            "TOTAL(TD.value_delta), COUNT(TD.value_delta) "
+            "TOTAL(TD.value_delta), COUNT(DISTINCT TD.tx_hash), TOTAL(TD.mnee_delta) "
         "FROM KeyInstances AS KI "
         "LEFT JOIN TransactionDeltas TD ON TD.keyinstance_id = KI.keyinstance_id "
         "WHERE KI.account_id = ? AND KI.keyinstance_id IN ({}) "
@@ -939,6 +942,8 @@ class TransactionDeltaTable(BaseWalletStore):
         "INNER JOIN KeyInstances AS KI ON TD.keyinstance_id = KI.keyinstance_id AND "
             "KI.account_id = ?"
         "GROUP BY TD.tx_hash, TD.keyinstance_id")
+    
+    # Modified to avoid archiving keys that have MNEE balances > 0
     READ_CANDIDATE_USED_KEYS = f"""
         WITH active_keys AS (
                 SELECT keyinstance_id
@@ -955,11 +960,26 @@ class TransactionDeltaTable(BaseWalletStore):
                 SELECT tx_history_table.keyinstance_id, tx_history_table.value_delta
                 FROM Transactions AS TX
                 JOIN tx_history_table ON TX.tx_hash = tx_history_table.tx_hash
-                WHERE TX.flags & {TxFlags.StateSettled} = {TxFlags.StateSettled})
+                WHERE TX.flags & {TxFlags.StateSettled} = {TxFlags.StateSettled}),
+                
+            mnee_balances AS (
+                SELECT keyinstance_id, 
+                       CASE WHEN json_extract(value, '$.mnee_balance') IS NULL 
+                            THEN 0 
+                            ELSE json_extract(value, '$.mnee_balance') 
+                       END as mnee_balance
+                FROM WalletData 
+                WHERE key LIKE 'key_%_mnee_balance'
+            )
 
-            SELECT keyinstance_id
+            SELECT settled_history.keyinstance_id
             FROM settled_history
-            GROUP BY keyinstance_id HAVING SUM(value_delta) == 0;"""
+            LEFT JOIN mnee_balances ON settled_history.keyinstance_id = mnee_balances.keyinstance_id
+            GROUP BY settled_history.keyinstance_id 
+            HAVING SUM(settled_history.value_delta) == 0 
+               AND (mnee_balances.mnee_balance IS NULL 
+                   OR mnee_balances.mnee_balance == 0);"""
+    
     DEACTIVATE_KEYINSTANCE_FLAGS = f"""
         UPDATE KeyInstances
         SET date_updated=?, flags=flags&{KeyInstanceFlag.INACTIVE_MASK}
@@ -967,8 +987,8 @@ class TransactionDeltaTable(BaseWalletStore):
     READ_ALL_SQL = "SELECT tx_hash, keyinstance_id, value_delta FROM TransactionDeltas"
     UPDATE_SQL = ("UPDATE TransactionDeltas SET date_updated=?, value_delta=? "
         "WHERE tx_hash=? AND keyinstance_id=?")
-    UPDATE_RELATIVE_SQL = ("UPDATE TransactionDeltas SET date_updated=?, value_delta=value_delta+? "
-        "WHERE tx_hash=? AND keyinstance_id=?")
+    UPDATE_RELATIVE_SQL = ("UPDATE TransactionDeltas SET date_updated=?, value_delta=value_delta+?, "
+        "mnee_delta=COALESCE(mnee_delta,0)+? WHERE tx_hash=? AND keyinstance_id=?")
     # self._UPSERT_SQL = (self._CREATE_SQL +" ON CONFLICT(keyinstance_id, tx_hash) DO UPDATE "+
     #     "SET value_delta=excluded.value_delta, date_updated=excluded.date_updated")
     DELETE_SQL = "DELETE FROM TransactionDeltas WHERE tx_hash=? AND keyinstance_id=?"
@@ -1037,7 +1057,7 @@ class TransactionDeltaTable(BaseWalletStore):
     def create_or_update_relative_values(self, entries: Iterable[TransactionDeltaRow],
             completion_callback: Optional[CompletionCallbackType]=None) -> None:
         timestamp = self._get_current_timestamp()
-        update_datas = [ (timestamp, r.value_delta, r.tx_hash, r.keyinstance_id) for r in entries ]
+        update_datas = [ (timestamp, r.value_delta, r.mnee_delta, r.tx_hash, r.keyinstance_id) for r in entries ]
         insert_datas = [ (*t, timestamp, timestamp) for t in entries ]
         def _write(db: sqlite3.Connection):
             db.executemany(self.UPDATE_RELATIVE_SQL, update_datas)
@@ -1067,20 +1087,23 @@ class TransactionDeltaTable(BaseWalletStore):
         cursor = self._db.execute(query, [account_id])
         rows = cursor.fetchall()
         cursor.close()
-        return [ TransactionDeltaKeySummaryRow(*t) for t in rows ]
+        return rows
 
     def read_history(self, account_id: int,
             keyinstance_ids: Optional[Sequence[int]]=None) -> List[TransactionDeltaHistoryRow]:
         params = [ account_id ]
         if keyinstance_ids:
-            return read_rows_by_id(TransactionDeltaHistoryRow, self._db,
+            # read_rows_by_id now returns raw tuples, so construct the objects here
+            raw_rows = read_rows_by_id(TransactionDeltaHistoryRow, self._db,
                 self.READ_HISTORY_DOMAIN_SQL, [ account_id ], keyinstance_ids)
+            # READ_HISTORY_DOMAIN_SQL selects T.tx_hash, T.flags, TOTAL(TD.value_delta)
+            return [ TransactionDeltaHistoryRow(row[0], TxFlags(row[1]), row[2], row[3]) for row in raw_rows ]
 
         query = self.READ_HISTORY_SQL
         cursor = self._db.execute(query, [account_id])
         rows = cursor.fetchall()
         cursor.close()
-        return [ TransactionDeltaHistoryRow(*t) for t in rows ]
+        return [ TransactionDeltaHistoryRow(t[0], TxFlags(t[1]), t[2], t[3]) for t in rows ]
 
     def read_paid_requests(self, account_id: int, keyinstance_ids: Sequence[int]) \
             -> List[int]:

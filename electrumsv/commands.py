@@ -27,12 +27,18 @@ import argparse
 from decimal import Decimal
 from functools import wraps
 import json
+import os
 import sys
-from typing import Dict
+from typing import Dict, Optional
+
+from bitcoinx import hash_to_hex_str
 
 from .bitcoin import COIN
 from .i18n import _
 from .logs import logs
+from .app_state import app_state
+from .constants import KeyInstanceFlag, CHANGE_SUBPATH, AccountType
+from .mnee import MneeAccount
 
 logger = logs.get_logger("commands")
 
@@ -148,6 +154,784 @@ class Commands:
         """Create a new account"""
         raise Exception('Not a JSON-RPC command')
 
+    @command('')
+    def listaddresses(self, show_all=False, account_id=None, id=None, address=None):
+        """List wallet addresses. Shows active addresses by default."""
+        # Normalize the address parameter if provided
+        if address is not None:
+            address = str(address).strip()
+            if not address:  # If it's empty after stripping
+                address = None
+        
+        # Check if running via daemon with a loaded wallet
+        daemon = app_state.daemon
+        if daemon and daemon.wallets:
+            if len(daemon.wallets) > 1:
+                # Multiple wallets loaded - need user to be more specific
+                wallet_paths = list(daemon.wallets.keys())
+                return {
+                    'error': f'Multiple wallets loaded. Please specify which wallet to use with -w. Available wallets: {wallet_paths}'
+                }
+            
+            # Get the single loaded wallet
+            wallet_path = next(iter(daemon.wallets.keys()))
+            wallet = daemon.wallets[wallet_path]
+            
+            # Check if account_id is specified
+            if account_id is not None:
+                # Find the account by ID
+                try:
+                    account_id = int(account_id)
+                    account = None
+                    for acc in wallet.get_accounts():
+                        if acc.get_id() == account_id:
+                            account = acc
+                            break
+                    
+                    if account is None:
+                        available_ids = [acc.get_id() for acc in wallet.get_accounts()]
+                        return {
+                            'error': f'Account ID {account_id} not found. Available account IDs: {available_ids}'
+                        }
+                except ValueError:
+                    return {
+                        'error': f'Invalid account ID: {account_id}. Account ID must be an integer.'
+                    }
+            else:
+                # No account_id specified, check if there's only one account
+                accounts = list(wallet.get_accounts())
+                if len(accounts) > 1:
+                    # Multiple accounts loaded - need user to be more specific
+                    account_ids = [account.get_id() for account in accounts]
+                    return {
+                        'error': f'Multiple accounts found in wallet. Please use "--account_id ID" to specify which account to use. Available account IDs: {account_ids}'
+                    }
+                
+                # Get the single account
+                account = accounts[0]
+            
+            account_id = account.get_id()
+            
+            # If keyinstance_id is specified, just return that specific address
+            if id is not None:
+                try:
+                    keyinstance_id = int(id)
+                    # Check if the keyinstance_id exists
+                    if keyinstance_id not in account.get_keyinstance_ids():
+                        return {
+                            'error': f'Key instance ID {keyinstance_id} not found in account {account_id}. Available key instance IDs: {list(account.get_keyinstance_ids())}'
+                        }
+                    
+                    # Get the single keyinstance
+                    keyinstance = account.get_keyinstance(keyinstance_id)
+                    
+                    # Check if we should include inactive keys
+                    if not show_all and keyinstance.flags & KeyInstanceFlag.IS_ACTIVE != KeyInstanceFlag.IS_ACTIVE:
+                        return {
+                            'error': f'Key instance ID {keyinstance_id} is not active. Use --show_all to include inactive keys.'
+                        }
+                    
+                    # Get script and script template
+                    script_template = account.get_script_template_for_id(keyinstance_id)
+                    
+                    # Try different ways to get the address string
+                    try:
+                        if hasattr(script_template, 'to_string'):
+                            address_str = script_template.to_string()
+                        elif hasattr(script_template, '__str__'):
+                            address_str = str(script_template)
+                        else:
+                            script = account.get_script_for_id(keyinstance_id)
+                            address_str = str(script)
+                    except Exception as e:
+                        address_str = f"<unable to convert to address: {e}>"
+                        
+                    script_type = keyinstance.script_type.name
+                    
+                    # Include MNEE data if available
+                    mnee_data = {}
+                    if hasattr(account, 'get_mnee_balance_for_keyid'):
+                        try:
+                            mnee_balance = account.get_mnee_balance_for_keyid(keyinstance_id)
+                            mnee_data['mnee_balance'] = mnee_balance
+                        except:
+                            pass
+                        
+                    address_data = {
+                        'address': address_str,
+                        'keyinstance_id': keyinstance_id,
+                        'is_change': account.get_derivation_path(keyinstance_id) is not None and \
+                                      len(account.get_derivation_path(keyinstance_id)) > 0 and \
+                                      account.get_derivation_path(keyinstance_id)[0] == CHANGE_SUBPATH[0],
+                        'script_type': script_type
+                    }
+                    
+                    # Add MNEE data if available
+                    if mnee_data:
+                        address_data.update(mnee_data)
+                    
+                    return {f'account_{account_id}': [address_data]}
+                    
+                except ValueError:
+                    return {
+                        'error': f'Invalid key instance ID: {id}. Key instance ID must be an integer.'
+                    }
+            
+            # Get all addresses for this account
+            addresses = []
+            for keyinstance_id in account.get_keyinstance_ids():
+                keyinstance = account.get_keyinstance(keyinstance_id)
+                if not show_all and keyinstance.flags & KeyInstanceFlag.IS_ACTIVE != KeyInstanceFlag.IS_ACTIVE:
+                    continue
+                    
+                # Get script and script template
+                script_template = account.get_script_template_for_id(keyinstance_id)
+                
+                # Try different ways to get the address string
+                try:
+                    if hasattr(script_template, 'to_string'):
+                        address_str = script_template.to_string()
+                    elif hasattr(script_template, '__str__'):
+                        address_str = str(script_template)
+                    else:
+                        script = account.get_script_for_id(keyinstance_id)
+                        address_str = str(script)
+                except Exception as e:
+                    address_str = f"<unable to convert to address: {e}>"
+                    
+                # Skip if filtering by address and this doesn't match
+                if address is not None:
+                    # Ensure address is treated as string for comparison
+                    if str(address) != str(address_str):
+                        continue
+                    
+                script_type = keyinstance.script_type.name
+                
+                # Include MNEE data if available
+                mnee_data = {}
+                if hasattr(account, 'get_mnee_balance_for_keyid'):
+                    try:
+                        mnee_balance = account.get_mnee_balance_for_keyid(keyinstance_id)
+                        mnee_data['mnee_balance'] = mnee_balance
+                    except:
+                        pass
+                    
+                address_data = {
+                    'address': address_str,
+                    'keyinstance_id': keyinstance_id,
+                    'is_change': account.get_derivation_path(keyinstance_id) is not None and \
+                                  len(account.get_derivation_path(keyinstance_id)) > 0 and \
+                                  account.get_derivation_path(keyinstance_id)[0] == CHANGE_SUBPATH[0],
+                    'script_type': script_type
+                }
+                
+                # Add MNEE data if available
+                if mnee_data:
+                    address_data.update(mnee_data)
+                    
+                addresses.append(address_data)
+                
+            # If filtering by address and none found, return an error
+            if address is not None and not addresses:
+                return {
+                    'error': f'Address {address} not found in account {account_id}.'
+                }
+                
+            return {f'account_{account_id}': addresses}
+            
+        # If no daemon or no wallets loaded, or using via file path
+        elif self._wallet is not None:
+            wallet = self._wallet
+            
+            # Check if account_id is specified
+            if account_id is not None:
+                # Find the account by ID
+                try:
+                    account_id = int(account_id)
+                    account = None
+                    for acc in wallet.get_accounts():
+                        if acc.get_id() == account_id:
+                            account = acc
+                            break
+                    
+                    if account is None:
+                        available_ids = [acc.get_id() for acc in wallet.get_accounts()]
+                        return {
+                            'error': f'Account ID {account_id} not found. Available account IDs: {available_ids}'
+                        }
+                except ValueError:
+                    return {
+                        'error': f'Invalid account ID: {account_id}. Account ID must be an integer.'
+                    }
+            else:
+                # No account_id specified, check if there's only one account
+                accounts = list(wallet.get_accounts())
+                if len(accounts) > 1:
+                    # Multiple accounts loaded - need user to be more specific
+                    account_ids = [account.get_id() for account in accounts]
+                    return {
+                        'error': f'Multiple accounts found in wallet. Please use "--account_id ID" to specify which account to use. Available account IDs: {account_ids}'
+                    }
+                
+                # Get the single account
+                account = accounts[0]
+            
+            account_id = account.get_id()
+            
+            # If keyinstance_id is specified, just return that specific address
+            if id is not None:
+                try:
+                    keyinstance_id = int(id)
+                    # Check if the keyinstance_id exists
+                    if keyinstance_id not in account.get_keyinstance_ids():
+                        return {
+                            'error': f'Key instance ID {keyinstance_id} not found in account {account_id}. Available key instance IDs: {list(account.get_keyinstance_ids())}'
+                        }
+                    
+                    # Get the single keyinstance
+                    keyinstance = account.get_keyinstance(keyinstance_id)
+                    
+                    # Check if we should include inactive keys
+                    if not show_all and keyinstance.flags & KeyInstanceFlag.IS_ACTIVE != KeyInstanceFlag.IS_ACTIVE:
+                        return {
+                            'error': f'Key instance ID {keyinstance_id} is not active. Use --show_all to include inactive keys.'
+                        }
+                    
+                    # Get script and script template
+                    script_template = account.get_script_template_for_id(keyinstance_id)
+                    
+                    # Try different ways to get the address string
+                    try:
+                        if hasattr(script_template, 'to_string'):
+                            address_str = script_template.to_string()
+                        elif hasattr(script_template, '__str__'):
+                            address_str = str(script_template)
+                        else:
+                            script = account.get_script_for_id(keyinstance_id)
+                            address_str = str(script)
+                    except Exception as e:
+                        address_str = f"<unable to convert to address: {e}>"
+                        
+                    script_type = keyinstance.script_type.name
+                    
+                    # Include MNEE data if available
+                    mnee_data = {}
+                    if hasattr(account, 'get_mnee_balance_for_keyid'):
+                        try:
+                            mnee_balance = account.get_mnee_balance_for_keyid(keyinstance_id)
+                            mnee_data['mnee_balance'] = mnee_balance
+                        except:
+                            pass
+                        
+                    address_data = {
+                        'address': address_str,
+                        'keyinstance_id': keyinstance_id,
+                        'is_change': account.get_derivation_path(keyinstance_id) is not None and \
+                                      len(account.get_derivation_path(keyinstance_id)) > 0 and \
+                                      account.get_derivation_path(keyinstance_id)[0] == CHANGE_SUBPATH[0],
+                        'script_type': script_type
+                    }
+                    
+                    # Add MNEE data if available
+                    if mnee_data:
+                        address_data.update(mnee_data)
+                    
+                    return {f'account_{account_id}': [address_data]}
+                    
+                except ValueError:
+                    return {
+                        'error': f'Invalid key instance ID: {id}. Key instance ID must be an integer.'
+                    }
+            
+            # Get all addresses for this account
+            addresses = []
+            for keyinstance_id in account.get_keyinstance_ids():
+                keyinstance = account.get_keyinstance(keyinstance_id)
+                if not show_all and keyinstance.flags & KeyInstanceFlag.IS_ACTIVE != KeyInstanceFlag.IS_ACTIVE:
+                    continue
+                    
+                # Get script and script template
+                script_template = account.get_script_template_for_id(keyinstance_id)
+                
+                # Try different ways to get the address string
+                try:
+                    if hasattr(script_template, 'to_string'):
+                        address_str = script_template.to_string()
+                    elif hasattr(script_template, '__str__'):
+                        address_str = str(script_template)
+                    else:
+                        script = account.get_script_for_id(keyinstance_id)
+                        address_str = str(script)
+                except Exception as e:
+                    address_str = f"<unable to convert to address: {e}>"
+                    
+                # Skip if filtering by address and this doesn't match
+                if address is not None:
+                    # Ensure address is treated as string for comparison
+                    if str(address) != str(address_str):
+                        continue
+                    
+                script_type = keyinstance.script_type.name
+                
+                # Include MNEE data if available
+                mnee_data = {}
+                if hasattr(account, 'get_mnee_balance_for_keyid'):
+                    try:
+                        mnee_balance = account.get_mnee_balance_for_keyid(keyinstance_id)
+                        mnee_data['mnee_balance'] = mnee_balance
+                    except:
+                        pass
+                    
+                address_data = {
+                    'address': address_str,
+                    'keyinstance_id': keyinstance_id,
+                    'is_change': account.get_derivation_path(keyinstance_id) is not None and \
+                                  len(account.get_derivation_path(keyinstance_id)) > 0 and \
+                                  account.get_derivation_path(keyinstance_id)[0] == CHANGE_SUBPATH[0],
+                    'script_type': script_type
+                }
+                
+                # Add MNEE data if available
+                if mnee_data:
+                    address_data.update(mnee_data)
+                    
+                addresses.append(address_data)
+                
+            # If filtering by address and none found, return an error
+            if address is not None and not addresses:
+                return {
+                    'error': f'Address {address} not found in account {account_id}.'
+                }
+                
+            return {f'account_{account_id}': addresses}
+            
+        else:
+            # No wallet loaded in daemon, and no wallet provided
+            return {'error': 'No wallet is currently loaded. Please run "electrum-sv daemon load_wallet -w YOUR_WALLET_PATH" first.'}
+
+    @command('')
+    def la(self, show_all=False, account_id=None, id=None, address=None):
+        """List all wallet addresses (alias for listaddresses)"""
+        return self.listaddresses(show_all, account_id, id, address)
+
+    @command('')
+    def addresstxs(self, id=None, address=None, account_id=None):
+        """List transactions for a specific address"""
+        # Normalize the address parameter if provided
+        if address is not None:
+            address = str(address).strip()
+            if not address:  # If it's empty after stripping
+                address = None
+                
+        # Check if running via daemon with a loaded wallet
+        daemon = app_state.daemon
+        if daemon and daemon.wallets:
+            if len(daemon.wallets) > 1:
+                # Multiple wallets loaded - need user to be more specific
+                wallet_paths = list(daemon.wallets.keys())
+                return {
+                    'error': f'Multiple wallets loaded. Please specify which wallet to use with -w. Available wallets: {wallet_paths}'
+                }
+            
+            # Get the single loaded wallet
+            wallet_path = next(iter(daemon.wallets.keys()))
+            wallet = daemon.wallets[wallet_path]
+            
+            # Handle account selection
+            if account_id is not None:
+                try:
+                    account_id = int(account_id)
+                    account = None
+                    for acc in wallet.get_accounts():
+                        if acc.get_id() == account_id:
+                            account = acc
+                            break
+                    
+                    if account is None:
+                        available_ids = [acc.get_id() for acc in wallet.get_accounts()]
+                        return {
+                            'error': f'Account ID {account_id} not found. Available account IDs: {available_ids}'
+                        }
+                except ValueError:
+                    return {
+                        'error': f'Invalid account ID: {account_id}. Account ID must be an integer.'
+                    }
+            else:
+                # No account_id specified, check if there's only one account
+                accounts = list(wallet.get_accounts())
+                if len(accounts) > 1:
+                    # Multiple accounts loaded - need user to be more specific
+                    account_ids = [account.get_id() for account in accounts]
+                    return {
+                        'error': f'Multiple accounts found in wallet. Please use "--account_id ID" to specify which account to use. Available account IDs: {account_ids}'
+                    }
+                
+                # Get the single account
+                account = accounts[0]
+            
+            account_id = account.get_id()
+            
+            # Determine the keyinstance_id
+            keyinstance_id = None
+            
+            # If key ID is provided, use that directly
+            if id is not None:
+                try:
+                    keyinstance_id = int(id)
+                    # Check if the keyinstance_id exists
+                    if keyinstance_id not in account.get_keyinstance_ids():
+                        return {
+                            'error': f'Key instance ID {keyinstance_id} not found in account {account_id}.'
+                        }
+                except ValueError:
+                    return {
+                        'error': f'Invalid key instance ID: {id}. Key instance ID must be an integer.'
+                    }
+            # If address is provided, find the corresponding key ID
+            elif address is not None:
+                found_key_id = None
+                for key_id in account.get_keyinstance_ids():
+                    script_template = account.get_script_template_for_id(key_id)
+                    addr_str = str(script_template)
+                    if addr_str == address:
+                        found_key_id = key_id
+                        break
+                if found_key_id is None:
+                    return {
+                        'error': f'Address {address} not found in account {account_id}.'
+                    }
+                keyinstance_id = found_key_id
+            else:
+                return {
+                    'error': 'You must specify either --id or --address'
+                }
+            
+            # Now we have the keyinstance_id, we can get transactions for it
+            try:
+                # Create a domain containing just this key ID - this follows the same
+                # pattern used in the UI's KeyDialog class
+                domain = [keyinstance_id]
+                
+                # Get history for this domain (key ID)
+                history_lines = account.get_history(domain)
+                
+                # Format the results
+                address_history = []
+                for history_line, balance in history_lines:
+                    tx_hash_hex = hash_to_hex_str(history_line.tx_hash)
+                    
+                    # Get a timestamp if available
+                    timestamp = None
+                    # Try to get transaction to extract timestamp
+                    tx = account.get_transaction(history_line.tx_hash)
+                    if tx and hasattr(tx.context, 'timestamp'):
+                        timestamp = tx.context.timestamp
+                    # If height is available, try to get timestamp from headers
+                    elif history_line.height is not None and history_line.height > 0:
+                        try:
+                            header = app_state.headers.header_at_height(app_state.headers.longest_chain(), 
+                                                                       history_line.height)
+                            if header:
+                                timestamp = header.timestamp
+                        except Exception:
+                            pass
+                    
+                    # Add to our history list
+                    tx_item = {
+                        'txid': tx_hash_hex,
+                        'height': history_line.height,
+                        'value': str(history_line.value_delta) if history_line.value_delta is not None else '0',
+                        'balance': str(balance) if balance is not None else '0',
+                        'timestamp': timestamp,
+                        'label': wallet.get_transaction_label(history_line.tx_hash) if hasattr(wallet, 'get_transaction_label') else None
+                    }
+                    
+                    # Add MNEE amount if available from history_line
+                    if hasattr(history_line, 'mnee_amount') and history_line.mnee_amount is not None:
+                        tx_item['mnee_amount'] = str(history_line.mnee_amount)
+                    
+                    address_history.append(tx_item)
+                
+                script_template = account.get_script_template_for_id(keyinstance_id)
+                address_str = str(script_template)
+                
+                # Prepare the response
+                result = {
+                    'address': address_str,
+                    'key_id': keyinstance_id,
+                    'transactions': address_history
+                }
+                
+                return result
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                return {
+                    'error': f'Error getting transaction history: {str(e)}',
+                    'traceback': tb
+                }
+        
+        # If no daemon or no wallets loaded, or using via file path
+        elif self._wallet is not None:
+            wallet = self._wallet
+            
+            # Handle account selection
+            if account_id is not None:
+                try:
+                    account_id = int(account_id)
+                    account = None
+                    for acc in wallet.get_accounts():
+                        if acc.get_id() == account_id:
+                            account = acc
+                            break
+                    
+                    if account is None:
+                        available_ids = [acc.get_id() for acc in wallet.get_accounts()]
+                        return {
+                            'error': f'Account ID {account_id} not found. Available account IDs: {available_ids}'
+                        }
+                except ValueError:
+                    return {
+                        'error': f'Invalid account ID: {account_id}. Account ID must be an integer.'
+                    }
+            else:
+                # No account_id specified, check if there's only one account
+                accounts = list(wallet.get_accounts())
+                if len(accounts) > 1:
+                    # Multiple accounts loaded - need user to be more specific
+                    account_ids = [account.get_id() for account in accounts]
+                    return {
+                        'error': f'Multiple accounts found in wallet. Please use "--account_id ID" to specify which account to use. Available account IDs: {account_ids}'
+                    }
+                
+                # Get the single account
+                account = accounts[0]
+            
+            account_id = account.get_id()
+            
+            # Same implementation as above
+            return {
+                'error': 'Direct wallet access not implemented. Please use daemon mode.'
+            }
+        
+        else:
+            # No wallet loaded in daemon, and no wallet provided
+            return {'error': 'No wallet is currently loaded. Please run "electrum-sv daemon load_wallet -w YOUR_WALLET_PATH" first.'}
+
+    @command('')
+    def atx(self, id=None, address=None, account_id=None):
+        """List transactions for a specific address (alias for addresstxs)"""
+        return self.addresstxs(id, address, account_id)
+
+    @command('')
+    def synchronize(self, account_id=None) -> Dict:
+        """Force synchronization of the wallet with blockchain.
+        
+        Args:
+            account_id: Optional account ID to limit synchronization to a specific account
+        
+        Returns a dict with operation results.
+        """
+        logger.debug("commands.py synchronize() method called")
+        # Check if running via daemon with a loaded wallet
+        daemon = app_state.daemon
+        if not self._wallet and daemon and daemon.wallets:
+            if len(daemon.wallets) > 1:
+                # Multiple wallets loaded - need user to be more specific
+                wallet_paths = list(daemon.wallets.keys())
+                return {
+                    'error': f'Multiple wallets loaded. Please specify which wallet to use with -w. Available wallets: {wallet_paths}'
+                }
+                
+            # Get the single loaded wallet
+            wallet_path = next(iter(daemon.wallets.keys()))
+            self._wallet = daemon.wallets[wallet_path]
+
+        # Still no wallet after trying to get from daemon
+        if not self._wallet:
+            return {'error': 'No wallet is currently loaded. Please run "electrum-sv daemon load_wallet -w YOUR_WALLET_PATH" first.'}
+            
+        result = {
+            'wallet_path': self._wallet.get_storage_path() if hasattr(self._wallet, 'get_storage_path') else 'unknown',
+            'address_count': 0,
+            'accounts': [],
+            'mnee_api_calls': 0,
+            'mnee_transactions_found': 0,
+            'errors': [],
+        }
+        
+        # Skip wallet-level synchronization since it doesn't exist
+        # Just get the accounts directly
+        accounts = list(self._wallet.get_accounts())
+
+        # Initial synchronization phase
+        account_results = []
+        for account in accounts:
+            account_result = {}
+            try:
+                # If that fails, try without parameters
+                account.synchronize()
+                
+                # Debug information collection
+                visible_keys = []
+                # Use public methods instead of direct attribute access
+                for key_id in account.get_keyinstance_ids():
+                    key = account.get_keyinstance(key_id)
+                    if key.flags & KeyInstanceFlag.IS_ACTIVE:
+                        visible_keys.append(key_id)
+
+                account_result['account_id'] = account.get_id()
+                account_result['visible_keys'] = len(visible_keys)
+                
+                # Check if this is an MNEE account and get the report
+                if isinstance(account, MneeAccount) and hasattr(account, '_last_synchronization_report'):
+                    mnee_report = account._last_synchronization_report
+                    account_result['mnee_report'] = mnee_report
+                    
+                    # Add key MNEE stats to the main result
+                    if 'mnee_api_calls' in mnee_report:
+                        result['mnee_api_calls'] += mnee_report['mnee_api_calls']
+                    if 'token_transactions_found' in mnee_report:
+                        result['mnee_transactions_found'] += mnee_report['token_transactions_found']
+                    if 'errors' in mnee_report:
+                        result['errors'].extend(mnee_report['errors'])
+                    
+                    # Add note about report access
+                    account_result['mnee_reports_available'] = True
+                
+                account_results.append(account_result)
+            except Exception as e:
+                error_msg = f"Error synchronizing account {account.get_id()}: {str(e)}"
+                result['errors'].append(error_msg)
+                
+        result['accounts'] = account_results
+        
+        # Add command info to access detailed reports
+        result['reports_info'] = {
+            'access_commands': {
+                'latest_report': 'mneesync',
+                'historical_reports': 'mneehistory'
+            }
+        }
+
+        return result
+
+    @command('')
+    def sync(self, account_id=None):
+        """Synchronize wallet/account with blockchain and MNEE data (alias for synchronize)"""
+        logger.debug("commands.py sync() alias method called")
+        return self.synchronize(account_id)
+
+    def mneesync(self, account_id: Optional[int] = None, full_report: bool = False) -> Dict:
+        """
+        Synchronize MNEE token data for an account and get the resulting report.
+        
+        Args:
+            account_id: Optional account ID to sync. Default is the first MNEE account.
+            full_report: If True, return the full detailed report instead of the compact one.
+            
+        Returns:
+            Dictionary with synchronization results.
+        """
+        from .mnee import MneeAccount
+        
+        wallet = self._wallet
+        if account_id is None:
+            # Find the first MNEE account
+            mnee_accounts = []
+            for account in wallet.get_accounts():
+                if isinstance(account, MneeAccount):
+                    mnee_accounts.append(account)
+            
+            if not mnee_accounts:
+                return {"error": "No MNEE accounts found in wallet"}
+            
+            account = mnee_accounts[0]
+            account_id = account.get_id()
+        else:
+            # Get the specified account
+            account = wallet.get_account(account_id)
+            if not isinstance(account, MneeAccount):
+                return {"error": f"Account {account_id} is not an MNEE account"}
+        
+        # Perform synchronization
+        account.synchronize()
+        
+        # Get the appropriate report based on the full_report flag
+        if full_report and hasattr(account, '_last_full_synchronization_report'):
+            report = account._last_full_synchronization_report
+            return {
+                "account_id": account_id,
+                "sync_report": report,
+                "note": "This is the full detailed report. Use without --full_report for a more concise view."
+            }
+        elif hasattr(account, '_last_synchronization_report'):
+            report = account._last_synchronization_report
+            return {
+                "account_id": account_id,
+                "sync_report": report
+            }
+        else:
+            return {
+                "account_id": account_id,
+                "sync_report": {"error": "No synchronization report available"}
+            }
+    
+    def mneehistory(self, account_id: Optional[int] = None, limit: int = 5, full_reports: bool = False) -> Dict:
+        """
+        Get MNEE token synchronization history.
+        
+        Args:
+            account_id: Optional account ID. Default is the first MNEE account.
+            limit: Maximum number of reports to retrieve. Default is 5.
+            full_reports: If True, return full detailed reports instead of compact ones.
+            
+        Returns:
+            Dictionary with synchronization history.
+        """
+        from .mnee import MneeAccount
+        
+        wallet = self._wallet
+        if account_id is None:
+            # Find the first MNEE account
+            mnee_accounts = []
+            for account in wallet.get_accounts():
+                if isinstance(account, MneeAccount):
+                    mnee_accounts.append(account)
+            
+            if not mnee_accounts:
+                return {"error": "No MNEE accounts found in wallet"}
+            
+            account = mnee_accounts[0]
+            account_id = account.get_id()
+        else:
+            # Get the specified account
+            account = wallet.get_account(account_id)
+            if not isinstance(account, MneeAccount):
+                return {"error": f"Account {account_id} is not an MNEE account"}
+        
+        # Get sync reports - we'll modify the get_sync_reports method to handle the full_reports flag
+        if hasattr(account, 'get_sync_reports'):
+            # Pass the report type (event_type) based on whether we want full or compact reports
+            event_type = 11 if full_reports else 10  # 11 for full reports, 10 for compact
+            reports = account.get_sync_reports(limit, event_type=event_type)
+            
+            result = {
+                "account_id": account_id,
+                "sync_reports": reports,
+                "count": len(reports)
+            }
+            
+            # Add a note about report type
+            if full_reports:
+                result["note"] = "Showing full detailed reports. Use without --full_reports for more concise views."
+            
+            return result
+        else:
+            return {
+                "account_id": account_id,
+                "error": "Account does not support synchronization reports"
+            }
 
 
 param_descriptions = {
@@ -202,6 +986,10 @@ command_options = {
     'show_addresses': (None, "Show input and output addresses"),
     'show_fiat':   (None, "Show fiat value of transactions"),
     'year':        (None, "Show history for a given year"),
+    'show_all':    (None, "Show all addresses including inactive ones"),
+    'account_id':  (None, "Specify which account to use when multiple accounts are available"),
+    'id':          (None, "Specify a specific address by key instance ID"),
+    'address':     (None, "Filter results to show only a specific address"),
 }
 
 
@@ -228,12 +1016,12 @@ config_variables = {
     'addrequest': {
         'url_rewrite': ('Parameters passed to str.replace(), in order to create the r= part '
                         'of bitcoin: URIs. Example: '
-                        '\"(\'file:///var/www/\',\'https://electrum.org/\')\"'),
+                        "\"(\'file:///var/www/\',\'https://electrum.org/\')\""),
     },
     'listrequests':{
         'url_rewrite': ('Parameters passed to str.replace(), in order to create the r= part '
                         'of bitcoin: URIs. Example: '
-                        '\"(\'file:///var/www/\',\'https://electrum.org/\')\"'),
+                        "\"(\'file:///var/www/\',\'https://electrum.org/\')\""),
     }
 }
 

@@ -44,7 +44,7 @@ logger = logs.get_logger("web")
 
 
 def BE_from_config(config):
-    return config.get('block_explorer', '')
+    return config.get('block_explorer', 'whatsonchain.com')
 
 def random_BE(kind: Optional[str]=None):
     possible_keys = [ k for (k, v) in Net.BLOCK_EXPLORERS.items()
@@ -54,8 +54,12 @@ def random_BE(kind: Optional[str]=None):
 
 def BE_URL(config, kind: str, item):
     selected_key = BE_from_config(config)
+    # Use whatsonchain.com as the default block explorer if none is specified
     if selected_key is None or selected_key not in Net.BLOCK_EXPLORERS:
-        selected_key = random_BE(kind)
+        selected_key = 'whatsonchain.com'
+        # If whatsonchain.com is not available for some reason, then look for a random explorer
+        if selected_key not in Net.BLOCK_EXPLORERS:
+            selected_key = random_BE(kind)
     be_tuple = Net.BLOCK_EXPLORERS.get(selected_key)
     if not be_tuple:
         return

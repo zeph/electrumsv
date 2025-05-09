@@ -621,3 +621,38 @@ class TriggeredCallbacks:
         with self._callback_lock:
             callbacks = self._callbacks[event][:]
         [callback(event, *args) for callback in callbacks]
+
+
+# Added function for MNEE
+def format_mnee_atomic(amount_atomic, decimals=0, token_unit_name=None):
+    """
+    Format MNEE amount from atomic units to display format
+    
+    Args:
+        amount_atomic: Integer amount in smallest MNEE units
+        decimals: Number of decimal places for the token (from token config)
+        token_unit_name: Optional custom token unit name, if None uses the one from config
+        
+    Returns:
+        Formatted string with appropriate decimal places
+    """
+    if amount_atomic is None:
+        return ""
+    
+    from electrumsv.app_state import app_state
+    # Get MNEE token configuration from app config if available
+    config = app_state.config
+    if decimals == 0:
+        decimals = config.get('mnee_token_decimals', 0)
+    
+    # Use provided token unit name or get from config
+    if token_unit_name is None:
+        token_unit_name = config.get('mnee_token_unit_name', 'MNEE')
+    
+    # Convert to decimal representation if needed
+    if decimals > 0:
+        formatted_amount = "{:.{prec}f}".format(amount_atomic / (10**decimals), prec=decimals)
+    else:
+        formatted_amount = str(amount_atomic)
+    
+    return f"{formatted_amount} {token_unit_name}"

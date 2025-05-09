@@ -28,7 +28,7 @@ class StorageKind(IntEnum):
 
 DATABASE_EXT = ".sqlite"
 MIGRATION_FIRST = 22
-MIGRATION_CURRENT = 26
+MIGRATION_CURRENT = 27
 
 class TxFlags(IntFlag):
     Unset = 0
@@ -120,6 +120,7 @@ class DerivationType(IntEnum):
     PUBLIC_KEY = 8
     PRIVATE_KEY = 9
     SCRIPT_HASH = 10
+    BIP32_MNEE = 11     # Metanet Enterprise Edition (BIP44 with coin_type 236)
 
 
 RECEIVING_SUBPATH = (0,)

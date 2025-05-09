@@ -157,6 +157,10 @@ class Daemon(DaemonThread):
             self.network = Network()
             app_state.fx = FxTask(app_state.config, self.network)
             self.fx_task = app_state.async_.spawn(app_state.fx.refresh_loop)
+            
+        # Initialize the cmd_runner
+        self.cmd_runner = Commands(config, None, self.network)
+            
         self.wallets: Dict[str, Wallet] = {}
         # RPC API - (synchronous)
         self.init_server(config, fd, is_gui)

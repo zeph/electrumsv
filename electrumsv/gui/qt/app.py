@@ -144,6 +144,44 @@ class SVApplication(QApplication):
         self.update_check_signal.connect(partial(self._signal_all, 'on_update_check'))
         ColorScheme.update_from_widget(QWidget())
 
+        # Check MNEE configuration
+        missing_keys = app_state.config.check_mnee_config()
+        from PyQt5.QtWidgets import QMessageBox
+        
+        # Filter out the environment info line which isn't a real missing key
+        env_info = next((line for line in missing_keys if line.startswith('Current mnee_environment')), None)
+        actual_missing_keys = [key for key in missing_keys if not key.startswith('Current mnee_environment')]
+        
+        if actual_missing_keys:
+            # Missing keys - show error and quit
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("MNEE Configuration Required")
+            msg.setText("The application requires MNEE configuration to continue.")
+            
+            # Create a simplified message without listing specific missing keys
+            message_text = "Add the following settings to ~/.electrum-sv/config:"
+            
+            # Add configuration example with full path
+            config_example = '\n    "mnee_environment": "sandbox",\n'
+            config_example += '    "mnee_api_key_sandbox": "",\n'
+            config_example += '    "mnee_api_key_prod": ""'
+            
+            msg.setInformativeText(message_text + config_example)
+            msg.setStandardButtons(QMessageBox.Ok)
+            ret = msg.exec_()
+            # Quit the application after the user confirms
+            sys.exit(0)
+        elif env_info and 'Current mnee_environment: None' not in env_info:
+            # Only show environment info if it's actually set
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("MNEE Configuration")
+            msg.setText("MNEE configuration is valid")
+            msg.setInformativeText(env_info)
+            msg.setStandardButtons(QMessageBox.Ok)
+            ret = msg.exec_()
+
     def _signal_all(self, method, *args):
         for window in self.windows:
             getattr(window, method)(*args)

@@ -70,6 +70,9 @@ def update_database(db: sqlite3.Connection) -> None:
         if version == 25:
             migrations.migration_0026_txo_coinbase_flag.execute(db)
             version += 1
+        if version == 26:
+            migrations.migration_0027_add_mnee_delta.execute(db)
+            version += 1
 
         if version != MIGRATION_CURRENT:
             db.rollback()

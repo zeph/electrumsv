@@ -69,6 +69,9 @@ class SimpleConfig:
         if self.requires_upgrade():
             self.upgrade()
 
+        # Check MNEE configuration
+        self.check_mnee_config()
+
     def electrum_path(self):
         # Read electrum_cash_path from command line
         # Otherwise use the user's default data directory.
@@ -269,6 +272,29 @@ class SimpleConfig:
         if device == 'default':
             device = ''
         return device
+
+    def check_mnee_config(self):
+        """Check if required MNEE configuration values are set.
+        Returns a list of missing configuration keys.
+        These keys should be set in the config file at ~/.electrum-sv/config"""
+        missing_keys = []
+        
+        # Check environment
+        env = self.get('mnee_environment')
+        if not env:
+            missing_keys.append('mnee_environment')
+        elif env not in ['sandbox', 'production']:
+            missing_keys.append(f'mnee_environment (must be "sandbox" or "production", current value: {env})')
+        else:
+            missing_keys.append(f'Current mnee_environment: {env}')
+        
+        # Check API keys based on environment
+        if env == 'sandbox' and not self.get('mnee_api_key_sandbox'):
+            missing_keys.append('mnee_api_key_sandbox')
+        elif env == 'production' and not self.get('mnee_api_key_prod'):
+            missing_keys.append('mnee_api_key_prod')
+        
+        return missing_keys
 
 
 def read_user_config(path):

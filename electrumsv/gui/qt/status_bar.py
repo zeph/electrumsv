@@ -85,17 +85,31 @@ class BalancePopup(QWidget):
         super().__init__(parent)
 
         grid_layout = QGridLayout()
-        grid_layout.addWidget(QLabel(_('Confirmed')), 0, 0, 1, 1)
-        grid_layout.addWidget(QLabel(_('Unconfirmed')), 1, 0, 1, 1)
-        grid_layout.addWidget(QLabel(_('Unmatured')), 2, 0, 1, 1)
+        # BSV Labels
+        grid_layout.addWidget(QLabel(_('Confirmed')+":"), 0, 0, 1, 1)
+        grid_layout.addWidget(QLabel(_('Unconfirmed')+":"), 1, 0, 1, 1)
+        grid_layout.addWidget(QLabel(_('Unmatured')+":"), 2, 0, 1, 1)
+        grid_layout.addWidget(QLabel("---"), 3, 0, 1, 3) # Separator
+        # MNEE Label
+        grid_layout.addWidget(QLabel(_('MNEE Total')+":"), 4, 0, 1, 1)
 
+        # Calculate Totals
         cc = uu = xx = 0
+        mnee_total_atomic = 0
+        first_account_mnee_unit = "MNEE" # Default unit name
+
         for account in main_window._wallet.get_accounts():
             c, u, x = account.get_balance()
             cc += c
             uu += u
             xx += x
+            # Get formatted MNEE balance for the account
+            # Passing config for potential future use, but not used by current stub
+            mnee_bal_str, mnee_unit = account.get_formatted_mnee_balance(app_state.config)
+            mnee_total_atomic += account.get_mnee_balance() # Accumulate atomic balance
+            first_account_mnee_unit = mnee_unit # Store unit name (should be consistent)
 
+        # Display BSV Balances
         balances = (cc, uu, xx)
         for i, balance in enumerate(balances):
             bsv_status, fiat_status = app_state.get_amount_and_units(balance)
@@ -103,6 +117,20 @@ class BalancePopup(QWidget):
             if status_bar._fiat_widget.isVisible():
                 grid_layout.addWidget(QLabel(fiat_status), i, 2, 1, 1, Qt.AlignRight)
 
+        # Display MNEE Total Balance
+        # Format the total atomic balance using the unit and decimals (using placeholder formatting)
+        mnee_decimals = 5 # Placeholder - should ideally get from config/wallet
+        if mnee_total_atomic == 0:
+            mnee_total_str = "0"
+        else:
+             scale_factor = 10**mnee_decimals
+             mnee_total_str = f"{mnee_total_atomic / scale_factor:.{mnee_decimals}f}"
+             mnee_total_str = mnee_total_str.rstrip('0').rstrip('.')
+             if mnee_total_str == "": mnee_total_str = "0"
+        
+        grid_layout.addWidget(QLabel(f"{mnee_total_str} {first_account_mnee_unit}"), 4, 1, 1, 1, Qt.AlignRight)
+        # TODO: Add fiat equivalent for MNEE if required
+        
         self.setLayout(grid_layout)
 
 
@@ -130,6 +158,8 @@ class StatusBar(QStatusBar):
 
     _network_label: QLabel = None
 
+    _balance_mnee_label: QLabel = None
+
     def __init__(self, main_window: 'ElectrumWindow') -> None:
         super().__init__(None)
         self._main_window = weakref.proxy(main_window)
@@ -145,11 +175,14 @@ class StatusBar(QStatusBar):
         hbox.addWidget(balance_icon_label)
         self._balance_bsv_label = QLabel("")
         hbox.addWidget(self._balance_bsv_label)
+        
+        # Add MNEE Label
+        self._balance_mnee_label = QLabel("") 
+        self._balance_mnee_label.setObjectName("StatusBarMneeBalanceLabel") # For styling/testing
+        hbox.addWidget(self._balance_mnee_label) # Add it to the layout
+
         self._balance_equals_label = QLabel("")
-        self._balance_equals_label.setPixmap(QPixmap(icon_path("sb_approximate")))
-        hbox.addWidget(self._balance_equals_label)
         self._balance_fiat_label = QLabel("")
-        hbox.addWidget(self._balance_fiat_label)
         # This is to pad out the text on the RHS so that the menu indicator does not overlay it.
         hbox.addWidget(QLabel(" "))
         balance_widget.setLayout(hbox)
@@ -199,6 +232,10 @@ class StatusBar(QStatusBar):
 
         self.notification_widget = NotificationIndicator(main_window)
         self.addPermanentWidget(self.notification_widget)
+
+    def set_mnee_balance_status(self, mnee_text: str) -> None:
+        self._balance_mnee_label.setText(mnee_text)
+        self._balance_mnee_label.setVisible(bool(mnee_text)) # Show/hide if text exists
 
     def set_balance_status(self, bsv_text: str, fiat_text: Optional[str]) -> None:
         have_fiat_text = bool(fiat_text)

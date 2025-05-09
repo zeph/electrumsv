@@ -59,6 +59,7 @@ from electrumsv.wallet_database.tables import (KeyInstanceRow, KeyInstanceFlag,
 from electrumsv import web
 
 from .main_window import ElectrumWindow
+from .main_window import format_mnee_atomic
 from .util import read_QIcon, get_source_index
 
 
@@ -66,7 +67,7 @@ QT_SORT_ROLE = Qt.UserRole+1
 QT_FILTER_ROLE = Qt.UserRole+2
 
 COLUMN_NAMES = [ _("Type"), _("State"), _('Key'), _('Script'), _('Label'), _('Usages'),
-    _('Balance'), '' ]
+    _('BSV Balance'), _('MNEE Balance'), '' ]
 
 TYPE_COLUMN = 0
 STATE_COLUMN = 1
@@ -75,7 +76,8 @@ SCRIPT_COLUMN = 3
 LABEL_COLUMN = 4
 USAGES_COLUMN = 5
 BALANCE_COLUMN = 6
-FIAT_BALANCE_COLUMN = 7
+MNEE_BALANCE_COLUMN = 7
+FIAT_BALANCE_COLUMN = 8
 
 
 class EventFlags(IntFlag):
@@ -221,13 +223,18 @@ class _ItemModel(QAbstractItemModel):
                     return self._view._account.get_keyinstance_label(line.keyinstance_id)
                 elif column == USAGES_COLUMN:
                     return line.match_count
-                elif column in (BALANCE_COLUMN, FIAT_BALANCE_COLUMN):
+                elif column in (BALANCE_COLUMN, MNEE_BALANCE_COLUMN, FIAT_BALANCE_COLUMN):
                     if column == BALANCE_COLUMN:
                         return line.total_value
+                    elif column == MNEE_BALANCE_COLUMN:
+                        return line.mnee_balance if hasattr(line, 'mnee_balance') else 0
                     elif column == FIAT_BALANCE_COLUMN:
                         fx = app_state.fx
                         rate = fx.exchange_rate()
-                        return fx.value_str(line.total_value, rate)
+                        try:
+                            return line.total_value * rate if rate else 0
+                        except:
+                            return 0
 
             elif role == QT_FILTER_ROLE:
                 if column == KEY_COLUMN:
@@ -261,12 +268,15 @@ class _ItemModel(QAbstractItemModel):
                     return line.match_count
                 elif column == BALANCE_COLUMN:
                     return app_state.format_amount(line.total_value, whitespaces=True)
+                elif column == MNEE_BALANCE_COLUMN:
+                    mnee_balance = line.mnee_balance if hasattr(line, 'mnee_balance') else 0
+                    return format_mnee_atomic(mnee_balance, 5, "")
                 elif column == FIAT_BALANCE_COLUMN:
                     fx = app_state.fx
                     rate = fx.exchange_rate()
                     return fx.value_str(line.total_value, rate)
             elif role == Qt.FontRole:
-                if column in (BALANCE_COLUMN, FIAT_BALANCE_COLUMN):
+                if column in (BALANCE_COLUMN, MNEE_BALANCE_COLUMN, FIAT_BALANCE_COLUMN):
                     return self._view._monospace_font
 
             elif role == Qt.BackgroundRole:
@@ -275,7 +285,7 @@ class _ItemModel(QAbstractItemModel):
             elif role == Qt.TextAlignmentRole:
                 if column in (TYPE_COLUMN, STATE_COLUMN):
                     return Qt.AlignCenter
-                elif column in (BALANCE_COLUMN, FIAT_BALANCE_COLUMN, USAGES_COLUMN):
+                elif column in (BALANCE_COLUMN, MNEE_BALANCE_COLUMN, FIAT_BALANCE_COLUMN, USAGES_COLUMN):
                     return Qt.AlignRight | Qt.AlignVCenter
                 return Qt.AlignVCenter
 
@@ -291,11 +301,16 @@ class _ItemModel(QAbstractItemModel):
                     key_id = line.keyinstance_id
                     masterkey_id = line.masterkey_id
                     derivation_text = self._view._account.get_derivation_path_text(key_id)
+                    mnee_text = format_mnee_atomic(line.mnee_balance, 5, "MNEE") if hasattr(line, 'mnee_balance') else "N/A"
                     return "\n".join([
                         f"Key instance id: {key_id}",
                         f"Master key id: {masterkey_id}",
                         f"Derivation path {derivation_text}",
+                        f"MNEE Balance: {mnee_text}"
                     ])
+                elif column == MNEE_BALANCE_COLUMN:
+                    mnee_balance = line.mnee_balance if hasattr(line, 'mnee_balance') else 0
+                    return format_mnee_atomic(mnee_balance, 5, "MNEE")
 
             elif role == Qt.EditRole:
                 if column == LABEL_COLUMN:
@@ -413,7 +428,7 @@ class KeyView(QTableView):
 
         self._update_lock = threading.Lock()
 
-        self._headers = COLUMN_NAMES
+        self._headers = COLUMN_NAMES[:MNEE_BALANCE_COLUMN+1]
 
         self.verticalHeader().setVisible(False)
         self.setAlternatingRowColors(True)
@@ -438,7 +453,7 @@ class KeyView(QTableView):
         fx = app_state.fx
         self._set_fiat_columns_enabled(fx and fx.get_fiat_address_config())
 
-        # Sort by type then by index, by making sure the initial sort is our type column.
+        # Sort by BSV Balance initially (descending)
         self.sortByColumn(BALANCE_COLUMN, Qt.DescendingOrder)
         self.setSortingEnabled(True)
 
@@ -463,6 +478,9 @@ class KeyView(QTableView):
         horizontalHeader.resizeSection(USAGES_COLUMN, fw(COLUMN_NAMES[USAGES_COLUMN]))
         balance_width = mw(app_state.format_amount(1.2, whitespaces=True))
         horizontalHeader.resizeSection(BALANCE_COLUMN, balance_width)
+        # Resize MNEE Balance column
+        mnee_balance_width = mw("999,999.99999 ") # Estimate width without unit
+        horizontalHeader.resizeSection(MNEE_BALANCE_COLUMN, mnee_balance_width)
 
         verticalHeader = self.verticalHeader()
         verticalHeader.setSectionResizeMode(QHeaderView.Fixed)
@@ -561,20 +579,6 @@ class KeyView(QTableView):
     def _have_pending_updates(self) -> bool:
         return bool(self._pending_actions) or bool(self._pending_state)
 
-    # def _dispatch_updates(self, pending_actions: Set[ListActions],
-    #         pending_state: Dict[int, Tuple[KeyInstanceRow, EventFlags]]) -> None:
-    #     import cProfile, pstats, io
-    #     from pstats import SortKey
-    #     pr = cProfile.Profile()
-    #     pr.enable()
-    #     self._dispatch_updates2(pending_actions, pending_state)
-    #     pr.disable()
-    #     s = io.StringIO()
-    #     sortby = SortKey.CUMULATIVE
-    #     ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-    #     ps.print_stats()
-    #     print(s.getvalue())
-
     @profiler
     def _dispatch_updates(self, pending_actions: Set[ListActions],
             pending_state: Dict[int, EventFlags]) -> None:
@@ -599,9 +603,6 @@ class KeyView(QTableView):
             elif flags & EventFlags.KEY_REMOVED:
                 removals.append(key_id)
 
-        # self._logger.debug("_on_update_check actions=%s adds=%d updates=%d removals=%d",
-        #     pending_actions, len(additions), len(updates), len(removals))
-
         self._remove_keys(removals)
         self._add_keys(account, additions, pending_state)
         self._update_keys(account, updates, pending_state)
@@ -609,6 +610,7 @@ class KeyView(QTableView):
         for action in pending_actions:
             if ListActions.RESET_BALANCES:
                 self._base_model.invalidate_column(BALANCE_COLUMN)
+                self._base_model.invalidate_column(MNEE_BALANCE_COLUMN)
             elif ListActions.RESET_FIAT_BALANCES:
                 fx = app_state.fx
                 flag = fx and fx.get_fiat_address_config()
@@ -748,8 +750,10 @@ class KeyView(QTableView):
 
         if flag:
             fx = app_state.fx
+            # Use the correct (shifted) index for the fiat column header
             self._base_model.set_column_name(FIAT_BALANCE_COLUMN, f"{fx.ccy} {_('Balance')}")
 
+        # Use the correct (shifted) index for hiding/showing the fiat column
         self.setColumnHidden(FIAT_BALANCE_COLUMN, not flag)
 
     def _event_double_clicked(self, model_index: QModelIndex) -> None:
@@ -864,16 +868,8 @@ class KeyView(QTableView):
                         menu.addAction(_("Show on {}").format(
                             keystore.plugin.device), show_key) # type: ignore
 
-            # freeze = self._main_window.set_frozen_state
-            key_ids = [ line.keyinstance_id
-                for (row, column, line, selected_index, base_index) in selected ]
-            # if any(self._account.is_frozen_address(addr) for addr in addrs):
-            #     menu.addAction(_("Unfreeze"), partial(freeze, self._account, addrs, False))
-            # if not all(self._account.is_frozen_address(addr) for addr in addrs):
-            #     menu.addAction(_("Freeze"), partial(freeze, self._account, addrs, True))
-
-            coins = self._account.get_spendable_coins(domain=key_ids,
-                config=self._main_window.config)
+            coins = self._account.get_spendable_coins(None,
+                self._main_window.config)
             if coins:
                 menu.addAction(_("Spend from"), partial(self._main_window.spend_coins, coins))
 

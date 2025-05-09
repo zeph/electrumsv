@@ -39,6 +39,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple, TypeVar, Optional, Union
 import weakref
 import webbrowser
+import sys
 
 import aiorpcx
 from bitcoinx import PublicKey
@@ -69,7 +70,7 @@ from electrumsv.transaction import Transaction, TransactionContext, txdict_from_
 from electrumsv.types import WaitingUpdateCallback
 from electrumsv.util import (
     bh2u, format_fee_satoshis, get_update_check_dates, get_identified_release_signers, profiler,
-    get_wallet_name_from_path
+    get_wallet_name_from_path, format_satoshis, format_mnee_atomic
 )
 from electrumsv.version import PACKAGE_VERSION
 from electrumsv.wallet import AbstractAccount, UTXO, Wallet
@@ -537,10 +538,14 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin):
         if winpos is not None:
             try:
                 screen = self.app.desktop().screenGeometry()
-                assert screen.contains(QRect(*winpos))
-                self.setGeometry(*winpos)
+                # Use an if check instead of assert to avoid noisy traceback
+                if screen.contains(QRect(*winpos)):
+                    self.setGeometry(*winpos)
+                else:
+                    self._logger.warning("Saved window position is outside current screen bounds. Using default geometry.")
+                    winpos = None # Force reset to default
             except Exception:
-                self._logger.exception("using default geometry")
+                self._logger.exception("Error processing saved window geometry. Using default geometry.")
                 winpos = None
         if winpos is None:
             self.setGeometry(100, 100, 840, 400)
@@ -1108,17 +1113,46 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin):
     def update_status_bar(self) -> None:
         "Update the entire status bar."
         fiat_status = None
-        # Display if offline. Display if online. Do not display if synchronizing.
+        bsv_balance_total = 0
+        mnee_balance_total_atomic = 0
+        mnee_unit_name = "MNEE" 
+        mnee_decimals = 5 
+        
+        wallet_accounts = self._wallet.get_accounts() # Use the method
+        if wallet_accounts: # Check if the list is not empty
+            # Get decimals from first account's MNEE config if possible
+            # TODO: Need a better way to store/access MNEE config (decimals) globally
+            first_account = wallet_accounts[0] # Use the list obtained
+            if hasattr(first_account, '_mnee_config') and first_account._mnee_config:
+                 mnee_decimals = first_account._mnee_config.get('decimals', 5)
+                 # Maybe store unit name from config too?
+            
+        # Loop through accounts to get total balances
         if self.network and self.network.is_connected():
-            # append fiat balance and price
             if app_state.fx.is_enabled():
-                balance = 0
-                for account in self._wallet.get_accounts():
+                for account in wallet_accounts: # Use the list obtained
                     c, u, x = account.get_balance()
-                    balance += c
+                    bsv_balance_total += c 
+                    mnee_balance_total_atomic += account.get_mnee_balance()
                 fiat_status = app_state.fx.get_fiat_status(
-                    balance, app_state.base_unit(), app_state.decimal_point)
-        self.set_status_bar_balance(True)
+                    bsv_balance_total, app_state.base_unit(), app_state.decimal_point)
+            else: # Calculate totals even if fiat is off
+                 for account in wallet_accounts: # Use the list obtained
+                    c, u, x = account.get_balance()
+                    bsv_balance_total += c 
+                    mnee_balance_total_atomic += account.get_mnee_balance()
+
+        # Format BSV total balance
+        bsv_total_text, _bsv_unit = app_state.get_amount_and_units(bsv_balance_total)
+        fiat_text_main = fiat_status[1] if fiat_status else None
+
+        # Format MNEE total balance using helper
+        mnee_total_text = format_mnee_atomic(mnee_balance_total_atomic, mnee_decimals, mnee_unit_name)
+
+        # Call the StatusBar's methods to set the text
+        self._status_bar.set_balance_status(bsv_total_text, fiat_text_main)
+        self._status_bar.set_mnee_balance_status(mnee_total_text) # Call new method
+        
         self._status_bar.set_fiat_status(fiat_status)
         self._update_network_status()
 
@@ -1166,6 +1200,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin):
         return self.create_list_tab(self.transaction_view)
 
     def show_key(self, account: AbstractAccount, key_id: int) -> None:
+        self._logger.debug(f"MainWindow: show_key called for account {account.get_id()} key {key_id}")
         from . import address_dialog
         d = address_dialog.KeyDialog(self, account.get_id(), key_id)
         d.exec_()
