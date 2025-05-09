@@ -78,6 +78,52 @@ class MneeAccount(StandardAccount):
         # Cache for the MNEE config, fetched once per instance
         self._mnee_config_cache = None
         
+        # Load any saved token data from the database
+        self._load_mnee_data_from_db()
+        
+    def _load_mnee_data_from_db(self) -> None:
+        """
+        Load MNEE token data from the wallet database.
+        This ensures continuity between sessions.
+        """
+        if not hasattr(self, '_wallet') or not hasattr(self._wallet, 'get_db_context'):
+            logger.debug("Cannot load MNEE data: wallet or db_context getter not available")
+            return
+            
+        try:
+            db_context = self._wallet.get_db_context()
+            wallet_data_table = WalletDataTable(db_context)
+            
+            # Get all wallet data rows - we'll filter ourselves
+            key_prefix = "mnee_key_data_"
+            rows = wallet_data_table.read()
+            
+            # Filter only rows with our prefix
+            matching_rows = [row for row in rows if row.key.startswith(key_prefix)]
+            
+            for row in matching_rows:
+                try:
+                    key_id_str = row.key[len(key_prefix):]
+                    key_id = int(key_id_str)
+                    
+                    # Parse the JSON data
+                    data_dict = json.loads(row.value)
+                    
+                    # Load token count and balance
+                    if 'tx_count' in data_dict:
+                        self._mnee_tx_count_per_key[key_id] = data_dict['tx_count']
+                    if 'balance' in data_dict:
+                        self._mnee_balances_per_key[key_id] = data_dict['balance']
+                        
+                    logger.debug(f"Loaded MNEE data for key {key_id}: tx_count={data_dict.get('tx_count', 0)}, balance={data_dict.get('balance', 0)}")
+                except Exception as row_error:
+                    logger.debug(f"Error parsing MNEE data row {row.key}: {str(row_error)}")
+            
+            logger.info(f"Loaded MNEE data for {len(matching_rows)} keys from WalletData table.")
+        except Exception as e:
+            logger.error(f"Error loading MNEE data from database: {str(e)}")
+            # Continue without the data - it will be rebuilt during the next synchronization
+    
     def get_cached_config(self):
         """
         Get the MNEE config from cache or fetch it if not available.
@@ -970,9 +1016,6 @@ class MneeAccount(StandardAccount):
                     # Get amount for this address if available 
                     amount = metadata.get('address_to_amount', {}).get(address, metadata.get('amount', 0))
                     
-                    # Update balance for this key
-                    current_balance = self._mnee_balances_per_key.get(key_id, 0)
-                    
                     # Make sure amount is never None
                     safe_amount = 0 if amount is None else amount
                     # Convert to int if needed
@@ -984,13 +1027,13 @@ class MneeAccount(StandardAccount):
                             safe_amount = 1  # Use 1 token (better than 0) as fallback
                     
                     # Now do the addition with the safe amount value
-                    self._mnee_balances_per_key[key_id] = current_balance + safe_amount
+                    self._mnee_balances_per_key[key_id] = current_balance = self._mnee_balances_per_key.get(key_id, 0) + safe_amount
                     
                     # Create token event data (BSV-20 token received)
                     event_data = {
                         "token_id": token_id,
                         "address": address,
-                        "amount": amount,
+                        "amount": safe_amount,  # Use safe_amount here too
                         "type": "TOKEN_RECEIVED",
                         "tx_hash": txid,
                         "timestamp": int(time.time()),
@@ -1005,7 +1048,29 @@ class MneeAccount(StandardAccount):
                     data_row = WalletDataRow(key=data_key, value=data_value)
                     wallet_data_table = WalletDataTable(db_context)
                     wallet_data_table.upsert([data_row])
-            
+                    
+                    # REGISTER THIS TRANSACTION IN THE STANDARD HISTORY
+                    # This ensures it appears in standard transaction listings
+                    # Pass event_data which includes the safe_amount we calculated
+                    self._register_transaction_for_key(txid, key_id, event_data)
+                
+                # Save the updated transaction counts and balances to the database
+                self._save_mnee_data_to_db()
+                    
+                # Only need the fallback sync_state registration if register_transaction_for_key failed
+                if hasattr(self, '_sync_state'):
+                    key_ids = list(address_to_key_map.values())
+                    
+                    # This is now handled by _register_transaction_for_key, but keep as fallback
+                    try:
+                        if hasattr(self._sync_state, 'set_transaction_key_ids'):
+                            self._sync_state.set_transaction_key_ids(txid, key_ids)
+                    except Exception as sync_error:
+                        logger.debug(f"Error updating sync state: {str(sync_error)}")
+                
+                logger.info(f"Stored MNEE token metadata for transaction {txid[:10]} with {len(address_to_key_map)} addresses using standard ESV patterns")
+            else:
+                logger.error(f"Cannot store MNEE token metadata: wallet has no db_context getter")
         except Exception as e:
             logger.error(f"Error processing transaction {txid[:10]}...: {str(e)}")
                 
@@ -1306,7 +1371,7 @@ class MneeAccount(StandardAccount):
                                     current_count = self._mnee_tx_count_per_key.get(key_id, 0)
                                     self._mnee_tx_count_per_key[key_id] = current_count + len(final_valid_txids)
                                     
-                                    # Record transactions in database and increment counters
+                                    # Process each transaction
                                     for txid in final_valid_txids:
                                         try:
                                             # Create a record in the database
@@ -1314,14 +1379,46 @@ class MneeAccount(StandardAccount):
                                                 db_context = self._wallet.get_db_context()
                                                 wallet_data_table = WalletDataTable(db_context)
                                                 
-                                                data_key = f"mnee_tx_processed_{txid[:8]}_{key_id}"
-                                                data_value = json.dumps({
+                                                # Try to extract the token amount from transaction
+                                                # Default to 0 instead of 1 - it's safer
+                                                token_amount = 0
+                                                try:
+                                                    # Check if we have a transaction in the cache with token data
+                                                    tx_hash_bytes = hex_str_to_hash(txid)
+                                                    if hasattr(self._wallet, '_transaction_cache'):
+                                                        tx = self._wallet._transaction_cache.get_transaction(tx_hash_bytes)
+                                                        if tx:
+                                                            # Try to extract BSV-20 token metadata
+                                                            output_metadata = self._extract_bsv20_metadata_from_tx(tx)
+                                                            # Get amount specific to this address
+                                                            if output_metadata and 'address_to_amount' in output_metadata:
+                                                                # Extract the amount specific to this address
+                                                                addr_amounts = output_metadata['address_to_amount']
+                                                                if address in addr_amounts:
+                                                                    token_amount = addr_amounts[address]
+                                                                    logger.debug(f"Found address-specific token amount {token_amount} for {address[:8]}")
+                                                except Exception as extract_error:
+                                                    logger.debug(f"Error extracting token amount for address {address}: {str(extract_error)}")
+                                                
+                                                # Basic metadata about this token transaction
+                                                tx_metadata = {
                                                     'txid': txid,
                                                     'key_id': key_id,
-                                                    'processed_time': int(time.time())
-                                                })
+                                                    'processed_time': int(time.time()),
+                                                    'address': address,
+                                                    'amount': token_amount
+                                                }
+                                                
+                                                # Save to WalletData table
+                                                data_key = f"mnee_tx_processed_{txid[:8]}_{key_id}"
+                                                data_value = json.dumps(tx_metadata)
                                                 data_row = WalletDataRow(key=data_key, value=data_value)
                                                 wallet_data_table.upsert([data_row])
+                                                
+                                                # REGISTER TRANSACTION IN STANDARD HISTORY
+                                                # This ensures it appears in address transaction history
+                                                # Pass the token amount to ensure it's included in the history
+                                                self._register_transaction_for_key(txid, key_id, tx_metadata)
                                         except Exception as e:
                                             logger.error(f"Error recording transaction {txid[:8]} for key {key_id}: {str(e)}")
                                     
@@ -1630,3 +1727,227 @@ class MneeAccount(StandardAccount):
 
         logger.debug(f"MneeAccount: tx {tx_id} not relevant to account {self.get_id()} after processing.")
         return False
+
+    def _register_transaction_for_key(self, txid: str, key_id: int, metadata: Dict = None) -> bool:
+        """
+        Register a transaction with a specific key in the standard transaction history.
+        This ensures all transactions (both BSV and token) appear in the standard address history.
+        
+        Args:
+            txid: The transaction ID (hex)
+            key_id: The keyinstance_id to associate with this transaction
+            metadata: Optional token metadata
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Convert txid to bytes for internal storage
+            tx_hash_bytes = hex_str_to_hash(txid)
+            
+            # Make sure key_id is valid
+            if key_id not in self._keyinstances:
+                logger.warning(f"Cannot register transaction {txid[:8]} for non-existent key {key_id}")
+                return False
+            
+            # Extract MNEE amount if available in metadata (for token transactions)
+            mnee_amount = None
+            if metadata and 'amount' in metadata:
+                try:
+                    mnee_amount = int(metadata['amount'])
+                except (ValueError, TypeError):
+                    pass
+                
+            # Register this transaction with this key in the sync state
+            # This makes it appear in the standard transaction history
+            if hasattr(self, '_sync_state'):
+                # Set transaction-key relationship in both directions
+                self._sync_state.set_key_history(key_id, [(txid, 0)])  # Height 0 means unconfirmed
+                
+                # Check if set_transaction_key_ids exists before calling it
+                if hasattr(self._sync_state, 'set_transaction_key_ids'):
+                    self._sync_state.set_transaction_key_ids(txid, [key_id])
+                else:
+                    logger.debug(f"SyncState doesn't have set_transaction_key_ids method, using alternative")
+                    # Alternative approach - add to key's history directly
+                    key_history = self._sync_state._key_history.get(key_id, [])
+                    if (txid, 0) not in key_history:
+                        key_history.append((txid, 0))
+                        self._sync_state._key_history[key_id] = key_history
+                
+                # STORE TOKEN AMOUNT IN WALLET DATA - This is safer than TransactionDelta
+                # If we have token amount information, store it in wallet data
+                if mnee_amount is not None and hasattr(self._wallet, 'get_db_context'):
+                    try:
+                        # Get the database connection
+                        db_context = self._wallet.get_db_context()
+                        wallet_data_table = WalletDataTable(db_context)
+                        
+                        # Create metadata with token information
+                        tx_metadata = {
+                            'mnee_amount': mnee_amount,
+                            'token_id': metadata.get('token_id', ''),
+                            'tx_hash': txid,
+                            'key_id': key_id,
+                            'timestamp': int(time.time())
+                        }
+                        
+                        # Store token transaction data in WalletData
+                        data_key = f"mnee_tx_amount_{txid[:16]}_{key_id}"
+                        data_value = json.dumps(tx_metadata)
+                        data_row = WalletDataRow(key=data_key, value=data_value)
+                        
+                        # Create or update the data
+                        wallet_data_table.upsert([data_row])
+                        logger.debug(f"Stored token amount data for {txid[:8]} with mnee_amount={mnee_amount}")
+                    except Exception as data_error:
+                        logger.error(f"Error storing token amount data: {str(data_error)}")
+                
+                # If necessary, trigger wallet to fetch the transaction
+                if hasattr(self._wallet, '_network') and self._wallet._network:
+                    # Check if the network object has the right method
+                    network = self._wallet._network
+                    if hasattr(network, 'get_transaction'):
+                        # Original approach - use get_transaction method
+                        network.get_transaction(txid)
+                    elif hasattr(network, 'request_tx'):
+                        # Alternative method - try request_tx if it exists
+                        network.request_tx(tx_hash_bytes)
+                    elif hasattr(network, 'request_transaction'):
+                        # Another possible method name
+                        network.request_transaction(txid)
+                    else:
+                        # Log the issue but don't fail
+                        logger.debug(f"Network object has no suitable method to request transaction {txid[:8]}")
+                
+                # Trigger wallet callbacks to update UI
+                if hasattr(self._wallet, 'trigger_callback'):
+                    # Notify that this key has been updated
+                    if key_id in self._keyinstances:
+                        key = self._keyinstances[key_id]
+                        self._wallet.trigger_callback('on_keys_updated', self.get_id(), [key])
+                    
+                    # Notify that a new transaction was added
+                    self._wallet.trigger_callback('on_wallet_transaction_added', self, tx_hash_bytes)
+                    
+                logger.info(f"Registered transaction {txid[:8]} with key {key_id} in standard history")
+                return True
+            else:
+                logger.warning(f"Cannot register transaction {txid[:8]} - no sync state available")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error registering transaction {txid[:8]} for key {key_id}: {str(e)}")
+            return False
+
+    def _extract_bsv20_metadata_from_tx(self, tx: Transaction) -> Dict:
+        """
+        Extract BSV-20 token metadata from a transaction.
+        This is used to get token amounts for specific addresses.
+        
+        Args:
+            tx: The transaction object to extract metadata from
+            
+        Returns:
+            Dictionary containing token metadata including address_to_amount mapping
+        """
+        result = {
+            'addresses': [],
+            'address_to_amount': {},
+            'token_id': '',
+            'total_amount': 0
+        }
+        
+        if not tx or not hasattr(tx, 'outputs'):
+            return result
+            
+        # Get token ID from config if available
+        config = app_state.config
+        token_id = config.get('bsv20_token_id', '')
+        if not token_id and self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
+            token_id = self._mnee_config_cache['tokenId']
+        result['token_id'] = token_id
+            
+        try:
+            # Maps P2PKH output indices to their addresses
+            output_idx_to_address = {}
+            
+            # First pass - collect all P2PKH output addresses
+            for output_index, output in enumerate(tx.outputs):
+                script_bytes = bytes(output.script_pubkey)
+                # Skip OP_RETURN outputs
+                if len(script_bytes) > 0 and script_bytes[0] != 0x6a:
+                    try:
+                        from bitcoinx import Script
+                        script = Script(output.script_pubkey)
+                        if hasattr(script, 'to_address'):
+                            address = script.to_address()
+                            if address:
+                                output_idx_to_address[output_index] = address
+                    except Exception as e:
+                        logger.debug(f"Error extracting address from output {output_index}: {str(e)}")
+            
+            # Second pass - parse BSV-20 OP_RETURN scripts
+            for output_index, output in enumerate(tx.outputs):
+                script_bytes = bytes(output.script_pubkey)
+                
+                # Look for OP_RETURN
+                if len(script_bytes) > 0 and script_bytes[0] == 0x6a:  # OP_RETURN
+                    try:
+                        # Skip OP_RETURN byte
+                        op_return_data = script_bytes[1:]
+                        
+                        # Skip push opcodes if present
+                        if len(op_return_data) > 0:
+                            if op_return_data[0] <= 0x4b:  # Direct push bytes 1-75
+                                push_size = op_return_data[0]
+                                op_return_data = op_return_data[1:1+push_size]
+                            elif op_return_data[0] == 0x4c:  # OP_PUSHDATA1
+                                push_size = op_return_data[1]
+                                op_return_data = op_return_data[2:2+push_size]
+                            elif op_return_data[0] == 0x4d:  # OP_PUSHDATA2
+                                push_size = int.from_bytes(op_return_data[1:3], byteorder='little')
+                                op_return_data = op_return_data[3:3+push_size]
+                            elif op_return_data[0] == 0x4e:  # OP_PUSHDATA4
+                                push_size = int.from_bytes(op_return_data[1:5], byteorder='little')
+                                op_return_data = op_return_data[5:5+push_size]
+                        
+                        # Try to decode as UTF-8
+                        data_str = op_return_data.decode('utf-8', errors='ignore')
+                        
+                        # Look for BSV-20 JSON structures
+                        if ('bsv-20' in data_str.lower() or 'bsv20' in data_str.lower()) and 'id' in data_str and 'amt' in data_str:
+                            # Try to find a valid JSON object within the string
+                            import re
+                            json_match = re.search(r'\{.*"p"\s*:\s*"bsv-?20".*\}', data_str)
+                            if json_match:
+                                json_str = json_match.group(0)
+                                try:
+                                    bsv20_data = json.loads(json_str)
+                                    # Check for transfer operation with an amount
+                                    if 'op' in bsv20_data and bsv20_data['op'] == 'transfer' and 'amt' in bsv20_data:
+                                        amt_str = bsv20_data['amt']
+                                        amount = int(amt_str)
+                                        result['total_amount'] += amount
+                                        
+                                        # Update token_id if found in the script
+                                        if 'id' in bsv20_data and bsv20_data['id']:
+                                            result['token_id'] = bsv20_data['id']
+                                        
+                                        # The recipient address is typically in the next output
+                                        recipient_idx = output_index + 1
+                                        if recipient_idx in output_idx_to_address:
+                                            recipient_addr = output_idx_to_address[recipient_idx]
+                                            if recipient_addr:
+                                                if str(recipient_addr) not in result['addresses']:
+                                                    result['addresses'].append(str(recipient_addr))
+                                                result['address_to_amount'][str(recipient_addr)] = amount
+                                                logger.debug(f"BSV-20 transfer extracted: {amount} to {recipient_addr}")
+                                except json.JSONDecodeError as json_err:
+                                    logger.debug(f"Failed to parse BSV-20 JSON: {str(json_err)}")
+                    except Exception as e:
+                        logger.debug(f"Error parsing BSV-20 OP_RETURN at output {output_index}: {str(e)}")
+        except Exception as e:
+            logger.debug(f"Error extracting BSV-20 metadata from transaction: {str(e)}")
+            
+        return result
