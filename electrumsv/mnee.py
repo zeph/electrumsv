@@ -684,6 +684,10 @@ class MneeAccount(StandardAccount):
 
                             response_data = json.loads(raw_data)
                             
+                            if len(response_data) == 0:
+                                logger.warning(f"NO DATA FOUND for Batch {batch_num}")
+                                continue # Skip to the next batch
+
                             # Process transactions for this batch
                             batch_stored_count, batch_all_successful = self._process_and_store_transactions(response_data)
                             result['transactions_stored'] += batch_stored_count
@@ -1545,12 +1549,41 @@ class MneeAccount(StandardAccount):
                 logger.debug(f"Got response with {tx_count} transactions")
                 
                 # Process transactions from API response
-                if isinstance(api_response, list) and api_response:
+                # More robust handling of API response formats
+                transactions_to_process = []
+                
+                # Handle different possible response formats
+                if isinstance(api_response, list):
+                    # Direct list of transactions
+                    transactions_to_process = api_response
+                elif isinstance(api_response, dict):
+                    # Response could have transactions under various keys
+                    if 'transactions' in api_response and isinstance(api_response['transactions'], list):
+                        transactions_to_process = api_response['transactions']
+                    elif 'data' in api_response and isinstance(api_response['data'], list):
+                        transactions_to_process = api_response['data']
+                    elif 'results' in api_response and isinstance(api_response['results'], list):
+                        transactions_to_process = api_response['results']
+                    # If no recognized structure, log the keys to help debug
+                    else:
+                        keys = list(api_response.keys())
+                        logger.warning(f"Unknown API response structure with keys: {keys}")
+                        # Try to extract any iterable data
+                        for key, value in api_response.items():
+                            if isinstance(value, list) and value:
+                                logger.info(f"Found potential transaction list in key '{key}' with {len(value)} items")
+                                if len(transactions_to_process) == 0:  # Only use the first non-empty list found
+                                    transactions_to_process = value
+                
+                # Log the actual response type and structure to help debug
+                logger.debug(f"API response type: {type(api_response)}, found {len(transactions_to_process)} transactions to process")
+                
+                if transactions_to_process:
                     # Create address -> [txids] mapping
                     address_to_txids = {}
                     
                     # Process each transaction
-                    for tx_item in api_response:
+                    for tx_item in transactions_to_process:
                         if not isinstance(tx_item, dict):
                             continue
                             
@@ -1800,6 +1833,27 @@ class MneeAccount(StandardAccount):
                         # Create or update the data
                         wallet_data_table.upsert([data_row])
                         logger.debug(f"Stored token amount data for {txid[:8]} with mnee_amount={mnee_amount}")
+                        
+                        # ADD TRANSACTION DELTA FOR TOKEN AMOUNT
+                        # This ensures the transaction shows up in standard transaction history
+                        try:
+                            # Create token metadata
+                            token_metadata = json.dumps({'mnee_amount': mnee_amount})
+                            
+                            # Create a transaction delta with mnee_amount as metadata
+                            # Value MUST be an explicit integer 0 for token transactions (no BSV value change)
+                            bsv_value = 0  # Explicit integer zero for BSV delta
+                            delta_row = TransactionDeltaRow(tx_hash_bytes, key_id, bsv_value, token_metadata)
+                            
+                            # Use the wallet's method to store it safely
+                            self._wallet.create_or_update_transactiondelta_relative(
+                                [delta_row], 
+                                lambda ki_ids: None  # No request checking needed
+                            )
+                            
+                            logger.debug(f"Created transaction delta record for token tx {txid[:8]} amount={mnee_amount}")
+                        except Exception as delta_error:
+                            logger.error(f"Error creating transaction delta: {str(delta_error)}")
                     except Exception as data_error:
                         logger.error(f"Error storing token amount data: {str(data_error)}")
                 
