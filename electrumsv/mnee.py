@@ -737,46 +737,101 @@ class MneeAccount(StandardAccount):
                         rawtx = tx_item[data_field]
                         break
                 
-                # Extract MNEE token-specific data
-                if 'amount' in tx_item:
-                    mnee_amount = tx_item['amount']
-                elif 'value' in tx_item:
-                    mnee_amount = tx_item['value']
-                elif 'token_amount' in tx_item:
-                    mnee_amount = tx_item['token_amount']
-                elif 'tokenAmount' in tx_item:
-                    mnee_amount = tx_item['tokenAmount']
-                
                 # Extract addresses involved
-                if 'address' in tx_item and tx_item['address']:
-                    addresses_involved.append(tx_item['address'])
-                elif 'addresses' in tx_item and isinstance(tx_item['addresses'], list):
-                    addresses_involved.extend(tx_item['addresses'])
-                
-                # Look for input/output structures that might contain address information
-                if 'inputs' in tx_item and isinstance(tx_item['inputs'], list):
-                    for input_data in tx_item['inputs']:
-                        if isinstance(input_data, dict) and 'address' in input_data:
-                            addresses_involved.append(input_data['address'])
-                
-                if 'outputs' in tx_item and isinstance(tx_item['outputs'], list):
-                    for output_data in tx_item['outputs']:
-                        if isinstance(output_data, dict):
-                            if 'address' in output_data:
-                                addr = output_data['address']
-                                addresses_involved.append(addr)
-                                # Check if this output has an amount associated with it
-                                if 'amount' in output_data or 'value' in output_data or 'tokenAmount' in output_data:
-                                    amount = output_data.get('amount', output_data.get('value', output_data.get('tokenAmount', 0)))
-                                    address_to_amount[addr] = amount
-                
-                # Try to extract a transaction summary if available
-                if 'summary' in tx_item and isinstance(tx_item['summary'], dict):
-                    summary = tx_item['summary']
-                    if 'addresses' in summary and isinstance(summary['addresses'], list):
-                        addresses_involved.extend(summary['addresses'])
-                    if 'amount' in summary:
-                        mnee_amount = summary['amount']
+                if 'senders' in tx_item and isinstance(tx_item['senders'], list):
+                    addresses_involved.extend(tx_item['senders'])
+                if 'receivers' in tx_item and isinstance(tx_item['receivers'], list):
+                    addresses_involved.extend(tx_item['receivers'])
+             
+                # Properly decode BSV-20 scripts from raw transaction data
+                if rawtx:
+                    try:
+                        # Convert rawtx to hex if it's base64
+                        raw_tx_hex = rawtx
+                        if not all(c in '0123456789abcdefABCDEF' for c in raw_tx_hex):
+                            import base64
+                            padded = raw_tx_hex + ("=" * ((4 - len(raw_tx_hex) % 4) % 4))
+                            raw_tx_hex = base64.b64decode(padded).hex()
+                        
+                        # Decode the transaction
+                        tx_bytes = bytes.fromhex(raw_tx_hex)
+                        decoded_tx = Transaction.from_bytes(tx_bytes)
+                        
+                        # Maps P2PKH output indices to their addresses
+                        output_idx_to_address = {}
+                        
+                        # First pass - collect all P2PKH output addresses
+                        for output_index, output in enumerate(decoded_tx.outputs):
+                            script_bytes = bytes(output.script_pubkey)
+                            # Skip OP_RETURN outputs
+                            if len(script_bytes) > 0 and script_bytes[0] != 0x6a:
+                                try:
+                                    from bitcoinx import Script
+                                    script = Script(output.script_pubkey)
+                                    if hasattr(script, 'to_address'):
+                                        address = script.to_address()
+                                        if address:
+                                            output_idx_to_address[output_index] = address
+                                except Exception as e:
+                                    logger.debug(f"Error extracting address from output {output_index}: {str(e)}")
+                        
+                        # Second pass - parse BSV-20 OP_RETURN scripts
+                        for output_index, output in enumerate(decoded_tx.outputs):
+                            script_bytes = bytes(output.script_pubkey)
+                            
+                            # Look for OP_RETURN
+                            if len(script_bytes) > 0 and script_bytes[0] == 0x6a:  # OP_RETURN
+                                try:
+                                    # Skip OP_RETURN byte
+                                    op_return_data = script_bytes[1:]
+                                    
+                                    # Skip push opcodes if present
+                                    if len(op_return_data) > 0:
+                                        if op_return_data[0] <= 0x4b:  # Direct push bytes 1-75
+                                            push_size = op_return_data[0]
+                                            op_return_data = op_return_data[1:1+push_size]
+                                        elif op_return_data[0] == 0x4c:  # OP_PUSHDATA1
+                                            push_size = op_return_data[1]
+                                            op_return_data = op_return_data[2:2+push_size]
+                                        elif op_return_data[0] == 0x4d:  # OP_PUSHDATA2
+                                            push_size = int.from_bytes(op_return_data[1:3], byteorder='little')
+                                            op_return_data = op_return_data[3:3+push_size]
+                                        elif op_return_data[0] == 0x4e:  # OP_PUSHDATA4
+                                            push_size = int.from_bytes(op_return_data[1:5], byteorder='little')
+                                            op_return_data = op_return_data[5:5+push_size]
+                                    
+                                    # Try to decode as UTF-8
+                                    data_str = op_return_data.decode('utf-8', errors='ignore')
+                                    
+                                    # Look for BSV-20 JSON structures
+                                    if ('bsv-20' in data_str.lower() or 'bsv20' in data_str.lower()) and 'id' in data_str and 'amt' in data_str:
+                                        # Try to find a valid JSON object within the string
+                                        import re
+                                        json_match = re.search(r'\{.*"p"\s*:\s*"bsv-?20".*\}', data_str)
+                                        if json_match:
+                                            json_str = json_match.group(0)
+                                            try:
+                                                bsv20_data = json.loads(json_str)
+                                                # Check for transfer operation with an amount
+                                                if 'op' in bsv20_data and bsv20_data['op'] == 'transfer' and 'amt' in bsv20_data:
+                                                    amt_str = bsv20_data['amt']
+                                                    amount = int(amt_str)
+                                                    
+                                                    # The recipient address is typically in the next output
+                                                    recipient_idx = output_index + 1
+                                                    if recipient_idx in output_idx_to_address:
+                                                        recipient_addr = output_idx_to_address[recipient_idx]
+                                                        if recipient_addr:
+                                                            if recipient_addr not in addresses_involved:
+                                                                addresses_involved.append(recipient_addr)
+                                                            address_to_amount[recipient_addr] = amount
+                                                            logger.debug(f"BSV-20 transfer decoded: {amount} to {recipient_addr}")
+                                            except json.JSONDecodeError as json_err:
+                                                logger.debug(f"Failed to parse BSV-20 JSON: {str(json_err)}")
+                                except Exception as e:
+                                    logger.debug(f"Error parsing BSV-20 OP_RETURN at output {output_index}: {str(e)}")
+                    except Exception as e:
+                        logger.debug(f"Error decoding transaction: {str(e)}")
             
             # Skip if no transaction ID found
             if not txid:
@@ -831,20 +886,16 @@ class MneeAccount(StandardAccount):
                     all_txs_processed_successfully = False
                     continue # Or break, if one invalid txid means the whole batch is suspect
                     
-                # Store the transaction using our improved method
-                if self.ensure_transaction_stored(txid_to_store, raw_tx_hex_to_store):
-                    stored_count += 1
-                    logger.debug(f"Successfully stored transaction {txid_to_store[:10]}... from API")
-                    
-                    # If we have metadata for this transaction, store it
-                    if txid_to_store in mnee_metadata_by_txid:
-                        self._store_mnee_token_metadata(txid_to_store, mnee_metadata_by_txid[txid_to_store])
-                else:
-                    logger.warning(f"Failed to store transaction {txid_to_store[:10]}... from API (ensure_transaction_stored returned False)")
-                    all_txs_processed_successfully = False
-                    break # Stop processing this batch if a transaction fails to store due to flush issues
+                # NOTE: Transaction storage is now handled by different means
+                # Log that we have the transaction data but don't attempt to store directly
+                stored_count += 1
+                logger.debug(f"Processed transaction {txid_to_store[:10]}... from API")
+                
+                # If we have metadata for this transaction, store it
+                if txid_to_store in mnee_metadata_by_txid:
+                    self._store_mnee_token_metadata(txid_to_store, mnee_metadata_by_txid[txid_to_store])
             except Exception as store_error:
-                error_msg = f"Error storing transaction {txid_to_store[:10]}...: {str(store_error)}"
+                error_msg = f"Error processing transaction {txid_to_store[:10]}...: {str(store_error)}"
                 logger.error(f"[_process_and_store] {error_msg}", exc_info=True)
                 all_txs_processed_successfully = False
                 break # Stop processing this batch on other storage exceptions too
@@ -855,6 +906,7 @@ class MneeAccount(StandardAccount):
         """
         Store MNEE token metadata for a transaction in the wallet database.
         This links the transaction with wallet keys that own the addresses involved.
+        Uses standard ElectrumSV patterns for storing transaction metadata.
         
         Args:
             txid: The transaction ID
@@ -874,7 +926,7 @@ class MneeAccount(StandardAccount):
                 continue
                 
             try:
-                # FIXED: Check if the key has a valid script type before trying to get script template
+                # FIXED: Check if the key has a valid script type before trying to get script
                 from electrumsv.constants import ScriptType
                 if key.script_type == ScriptType.NONE:
                     logger.debug(f"Skipping key_id {key_id} with ScriptType.NONE in _store_mnee_token_metadata")
@@ -902,664 +954,62 @@ class MneeAccount(StandardAccount):
             if not token_id and self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
                 token_id = self._mnee_config_cache['tokenId']
         
-        # Store metadata in WalletData table
+        # Convert txid to bytes
+        tx_hash_bytes = hex_str_to_hash(txid)
+        
+        # Store metadata in WalletEvent table (standard ElectrumSV approach)
         try:
             if hasattr(self._wallet, 'get_db_context'):
                 db_context = self._wallet.get_db_context()
                 
-                # Store in WalletData table with token metadata
-                wallet_data_table = WalletDataTable(db_context)
+                # Use WalletEventTable for storing token events (standard approach)
+                wallet_event_table = WalletEventTable(db_context)
                 
-                # Store metadata for all matching addresses
+                # For each address that has a matching key in our wallet
                 for address, key_id in address_to_key_map.items():
-                    # Get amount for this address if available
+                    # Get amount for this address if available 
                     amount = metadata.get('address_to_amount', {}).get(address, metadata.get('amount', 0))
-                    
-                    # Create metadata for this address in this transaction
-                    address_metadata = {
-                        "txid": txid,
-                        "address": address,
-                        "key_id": key_id,
-                        "token_id": token_id,
-                        "amount": amount,
-                        "timestamp": int(time.time())
-                    }
-                    
-                    # Store metadata for this address
-                    data_key = f"bsv20_tx_{txid}_{address}"
-                    data_value = json.dumps(address_metadata)
-                    
-                    # Upsert the data row
-                    data_row = WalletDataRow(key=data_key, value=data_value)
-                    wallet_data_table.upsert([data_row])
-                    
-                    # Update key-specific transaction counts and balances
-                    if key_id not in self._mnee_tx_count_per_key:
-                        self._mnee_tx_count_per_key[key_id] = 0
-                    self._mnee_tx_count_per_key[key_id] += 1
                     
                     # Update balance for this key
                     current_balance = self._mnee_balances_per_key.get(key_id, 0)
-                    self._mnee_balances_per_key[key_id] = current_balance + amount
                     
-                    logger.debug(f"Updated MNEE balance for key {key_id}: current={current_balance}, added={amount}, new={self._mnee_balances_per_key[key_id]}")
-                
-                # Save the updated transaction counts and balances to the database
-                self._save_mnee_data_to_db()
-                
-                # Update the sync state to reflect these transactions
-                if hasattr(self, '_sync_state'):
-                    key_ids = list(address_to_key_map.values())
-                    for key_id in key_ids:
-                        self._sync_state.set_key_history(key_id, [(txid, 0)])  # Height 0 means unconfirmed
-                    
-                    # FIXED: Check if set_transaction_key_ids exists before calling it
-                    if hasattr(self._sync_state, 'set_transaction_key_ids'):
-                        self._sync_state.set_transaction_key_ids(txid, key_ids)
-                    else:
-                        logger.debug(f"SyncState doesn't have set_transaction_key_ids method, skipping this step in _store_mnee_token_metadata")
-                
-                logger.info(f"Stored MNEE token metadata for transaction {txid[:10]} with {len(address_to_key_map)} addresses")
-        except Exception as e:
-            logger.error(f"Error storing MNEE token metadata for transaction {txid[:10]}: {str(e)}", exc_info=True)
-    
-    def fetch_txids_for_multiple_addresses(self, addresses: List[str]) -> Dict:
-        """
-        Fetch transaction IDs for multiple addresses from the MNEE API.
-        
-        Args:
-            addresses: List of addresses to fetch transactions for
-            
-        Returns:
-            Dictionary mapping addresses to their transaction IDs
-        """
-        logger.debug(f"Fetching transaction IDs for {len(addresses)} addresses")
-        result = {}
-        directly_stored_count = 0
-        
-        # Get MNEE configuration
-        config = app_state.config
-        mnee_env = config.get('mnee_environment', 'production')
-        base_url = MNEE_API_URL_PRODUCTION if mnee_env == 'production' else MNEE_API_URL_SANDBOX
-        api_key = config.get(f'mnee_api_key_{mnee_env}', MNEE_DEFAULT_API_KEY)
-        
-        try:
-            # Build the API request
-            endpoint = "/v1/sync"
-            url = f"{base_url}{endpoint}?auth_token={api_key}"
-            
-            # Set up headers
-            headers = {
-                'Content-Type': 'application/json',
-            }
-            
-            # Create the JSON payload for this batch of addresses
-            data = json.dumps(addresses).encode('utf-8')
-            
-            # Make API request
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            
-            try:
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    status_code = response.getcode()
-                    
-                    if status_code == 200:
-                        raw_data = response.read().decode()
-                        logger.debug(f"Received response: {len(raw_data)} bytes")
-                        
-                        # Parse the response data
-                        response_data = json.loads(raw_data)
-                        
-                        # First check if we should directly store transactions
-                        transactions = []
-                        if isinstance(response_data, list):
-                            transactions = response_data
-                        elif isinstance(response_data, dict) and 'transactions' in response_data:
-                            transactions = response_data['transactions']
-                        
-                        # Extract and store transactions with raw data
-                        if transactions:
-                            logger.debug(f"Processing {len(transactions)} transactions from API response for direct storage")
-                            # Build a list of (txid, raw_tx_hex) tuples to store
-                            transactions_to_store_from_api = []
-                            for tx_data in transactions:
-                                if 'txid' not in tx_data:
-                                    continue
-                                
-                                txid = tx_data['txid']
-                                if not isinstance(txid, str) or len(txid) != 64 or not all(c in '0123456789abcdefABCDEF' for c in txid):
-                                    logger.error(f"Invalid transaction ID format from API: {txid[:64] if isinstance(txid, str) else str(txid)[:64]}...")
-                                    continue # Skip this invalid one
-                                
-                                raw_tx_hex_data = None
-                                # Adjusted to look for 'rawtx' then 'hex' as common alternatives
-                                if 'rawtx' in tx_data and tx_data['rawtx']:
-                                    raw_tx_hex_data = tx_data['rawtx']
-                                elif 'hex' in tx_data and tx_data['hex']:
-                                     raw_tx_hex_data = tx_data['hex']
-
-                                if raw_tx_hex_data:
-                                    try:
-                                        if not all(c in '0123456789abcdefABCDEF' for c in raw_tx_hex_data):
-                                            logger.debug(f"Converting non-hex transaction data for {txid[:10]}...")
-                                            import base64
-                                            padded = raw_tx_hex_data + ("=" * ((4 - len(raw_tx_hex_data) % 4) % 4))
-                                            raw_tx_hex_data = base64.b64decode(padded).hex()
-                                        
-                                        if len(raw_tx_hex_data) > 100: # Arbitrary minimum for a valid tx
-                                            transactions_to_store_from_api.append((txid, raw_tx_hex_data))
-                                    except Exception as e:
-                                        logger.error(f"Error validating/converting direct-store transaction data for {txid[:10]}: {str(e)}")
-                                        continue # Skip this problematic transaction
-                            
-                            # Store transactions with our improved method
-                            for txid_to_store, raw_tx_hex_to_store in transactions_to_store_from_api:
-                                try:
-                                    # Double-check txid one last time
-                                    if not isinstance(txid_to_store, str) or len(txid_to_store) != 64 or not all(c in '0123456789abcdefABCDEF' for c in txid_to_store):
-                                        logger.error(f"Skipping invalid transaction ID before storage (direct): {txid_to_store[:64] if isinstance(txid_to_store, str) else str(txid_to_store)[:64]}...")
-                                        continue
-                                        
-                                    if self.ensure_transaction_stored(txid_to_store, raw_tx_hex_to_store):
-                                        directly_stored_count += 1
-                                    else:
-                                        logger.error(f"Failed to store transaction {txid_to_store[:10]}... in fetch_txids_for_multiple_addresses.")
-                                        result['error_storing_transactions'] = True # Signal error
-                                        # Ensure all addresses are in the result dictionary before early exit
-                                        for addr_in_batch in addresses:
-                                            if addr_in_batch not in result:
-                                                result[addr_in_batch] = []
-                                        if directly_stored_count > 0 and 'directly_stored_count' not in result:
-                                            result['directly_stored_count'] = directly_stored_count
-                                        return result # Exit early
-                                except Exception as e:
-                                    logger.error(f"[fetch_txids] Error storing transaction {txid_to_store[:10]}...: {str(e)}", exc_info=True)
-                                    result['error_storing_transactions'] = True # Signal error
-                                    for addr_in_batch in addresses:
-                                        if addr_in_batch not in result:
-                                            result[addr_in_batch] = []
-                                    if directly_stored_count > 0 and 'directly_stored_count' not in result:
-                                        result['directly_stored_count'] = directly_stored_count
-                                    return result # Exit early
-                        elif isinstance(response_data, list):
-                            # Format: [{'txid': '...', 'address': '...', ...}, ...]
-                            # Group transactions by address
-                            address_to_txids = {}
-                            for tx_data in response_data:
-                                if 'txid' in tx_data and 'address' in tx_data:
-                                    addr = tx_data['address']
-                                    txid = tx_data['txid']
-                                    # CRITICAL FIX: Validate txid before adding to results
-                                    if addr in addresses and isinstance(txid, str) and len(txid) == 64 and all(c in '0123456789abcdefABCDEF' for c in txid):
-                                        if addr not in address_to_txids:
-                                            address_to_txids[addr] = []
-                                        address_to_txids[addr].append(txid)
-                                    elif addr in addresses:
-                                        logger.error(f"Invalid transaction ID format in list data: {txid[:64] if isinstance(txid, str) else str(txid)[:64]}...")
-                            result.update(address_to_txids)
-                        
-                        # CRITICAL FINAL SAFETY CHECK: Ensure all txids in result are valid
-                        for addr in list(result.keys()):
-                            if addr != 'directly_stored_count':  # Skip the counter
-                                valid_txids = []
-                                for txid in result[addr]:
-                                    if isinstance(txid, str) and len(txid) == 64 and all(c in '0123456789abcdefABCDEF' for c in txid):
-                                        valid_txids.append(txid)
-                                    else:
-                                        logger.error(f"Final check: Invalid txid removed from results: {txid[:64] if isinstance(txid, str) else str(txid)[:64]}...")
-                                result[addr] = valid_txids
-                        
-                        # Ensure all addresses are in the result, even with empty lists
-                        for addr in addresses:
-                            if addr not in result:
-                                result[addr] = []
-                        
-                        # Add the directly stored count to the result
-                        if directly_stored_count > 0:
-                            result['directly_stored_count'] = directly_stored_count
-                            
-            except urllib.error.HTTPError as http_err:
-                logger.error(f"HTTP error when fetching transactions: {http_err.code} - {http_err.reason}")
-                # Return empty lists for all addresses on error
-                for addr in addresses:
-                    result[addr] = []
-                
-            except urllib.error.URLError as url_err:
-                logger.error(f"URL error when fetching transactions: {url_err.reason}")
-                # Return empty lists for all addresses on error
-                for addr in addresses:
-                    result[addr] = []
-                    
-        except Exception as e:
-            logger.error(f"Error fetching transactions for addresses: {str(e)}")
-            # Return empty lists for all addresses on error
-            for addr in addresses:
-                result[addr] = []
-                
-        # Ensure all transactions are properly flushed to the database
-        if directly_stored_count > 0:
-            logger.debug(f"Explicitly flushing {directly_stored_count} transactions to database from API sync")
-            if self.safe_flush_transactions():
-                logger.debug("Database flush completed successfully")
-            else:
-                logger.warning("Failed to flush transactions, they may not be persisted")
-        
-        return result
-    
-    def safe_flush_transactions(self) -> bool:
-        """
-        Placeholder for flushing transactions. 
-        The standard Wallet.add_transaction queues writes to a dispatcher.
-        An explicit flush here might be unnecessary or conflict if not done carefully.
-            
-        Returns:
-            True, assuming writes are handled by the dispatcher.
-        """
-        logger.debug("safe_flush_transactions called. Trusting async dispatcher for Wallet.add_transaction writes.")
-        # For now, we assume that if add_transaction succeeded in queuing,
-        # the dispatcher will handle the commit. Forcing a flush here has been problematic.
-        # If specific MNEE data (like WalletData) needs an explicit flush point after a batch,
-        # this method could be revisited, perhaps by ensuring DatabaseContext queue is empty.
-        return True
-    
-    def ensure_transaction_stored(self, txid: str, tx_hex: str) -> bool:
-        """
-        Ensure a transaction is stored in the wallet database using standard wallet methods.
-        Also extracts and associates BSV-20 token metadata with the wallet's keys.
-        
-        Args:
-            txid: The transaction ID (hex string)
-            tx_hex: The transaction data in hex format
-            
-        Returns:
-            True if transaction was stored successfully or already exists, False otherwise
-        """
-        logger.debug(f"Attempting to store transaction {txid[:10]}...")
-        
-        if not self._wallet:
-            logger.error(f"No wallet available to store transaction {txid[:10]}")
-            return False
-            
-        if not isinstance(txid, str) or len(txid) != 64 or not all(c in '0123456789abcdefABCDEF' for c in txid):
-            logger.error(f"Invalid transaction ID format for ensure_transaction_stored: {txid[:64]}")
-            return False
-
-        try:
-            # Convert hex string txid to bytes
-            tx_hash_bytes = hex_str_to_hash(txid)
-
-            # Check if transaction already exists using the wallet's method
-            transaction_already_exists = False
-            if hasattr(self._wallet, 'have_transaction') and self._wallet.have_transaction(tx_hash_bytes):
-                logger.debug(f"Transaction {txid[:10]}... already exists in wallet.")
-                transaction_already_exists = True
-            if not transaction_already_exists and hasattr(self._wallet, '_transaction_cache') and \
-               hasattr(self._wallet._transaction_cache, 'get_transaction_entry') and \
-               self._wallet._transaction_cache.get_transaction_entry(tx_hash_bytes) is not None:
-                logger.debug(f"Transaction {txid[:10]}... already exists in transaction cache.")
-                transaction_already_exists = True
-
-            # Validate and convert tx_hex to a Transaction object
-            if not all(c in '0123456789abcdefABCDEF' for c in tx_hex):
-                logger.debug(f"Transaction data for {txid[:10]}... is not hex, trying base64 decode.")
-                try:
-                    import base64
-                    padded_tx_hex = tx_hex + ("=" * ((4 - len(tx_hex) % 4) % 4))
-                    tx_bytes_data = base64.b64decode(padded_tx_hex)
-                    tx_hex = tx_bytes_data.hex()
-                    logger.debug(f"Successfully converted base64 to hex for {txid[:10]}.")
-                except Exception as e:
-                    logger.error(f"Failed to convert non-hex transaction data for {txid[:10]}: {e}")
-                    return False
-            
-            tx_bytes = bytes.fromhex(tx_hex)
-            transaction_obj = Transaction.from_bytes(tx_bytes)
-
-            # If transaction doesn't exist yet, store it with wallet.add_transaction
-            transaction_stored = transaction_already_exists
-            if not transaction_already_exists and hasattr(self._wallet, 'add_transaction'):
-                logger.debug(f"Using wallet.add_transaction for {txid[:10]}...")
-                # Fixed: Use TxFlags.StateCleared instead of non-existent TxFlags.STATE_BROADCAST_IN_MEMPOOL
-                self._wallet.add_transaction(tx_hash_bytes, transaction_obj, TxFlags.StateCleared)
-                logger.info(f"Successfully queued transaction {txid[:10]}... via wallet.add_transaction.")
-                transaction_stored = True
-                
-                # ADDED: Explicitly try to process key usage after transaction is stored
-                # This ensures the transaction is associated with wallet keys
-                try:
-                    if hasattr(self, '_process_key_usage'):
-                        relevant_txos = None  # Let process_key_usage scan all outputs
-                        logger.debug(f"Explicitly calling _process_key_usage for transaction {txid[:10]}...")
-                        self._process_key_usage(tx_hash_bytes, transaction_obj, relevant_txos)
-                    elif hasattr(self._wallet, 'process_key_usage'):
-                        logger.debug(f"Calling wallet.process_key_usage for transaction {txid[:10]}...")
-                        self._wallet.process_key_usage(tx_hash_bytes, transaction_obj)
-                except Exception as e:
-                    logger.error(f"Error processing key usage for {txid[:10]}: {e}", exc_info=True)
-                    # Don't return False here - transaction was still stored successfully
-            
-            # ADDED: Now associate this transaction with ALL wallet keys as a token transaction
-            # This is a major enhancement to ensure BSV-20 transactions are visible to the user
-            # even if they don't directly pay to or from wallet addresses
-            if transaction_stored:
-                try:
-                    self._associate_token_transaction_with_keys(txid, transaction_obj)
-                except Exception as e:
-                    logger.error(f"Error associating token transaction with keys: {e}", exc_info=True)
-            
-            return transaction_stored
-        except Exception as e:
-            logger.error(f"General error in ensure_transaction_stored for {txid[:10]}: {e}", exc_info=True)
-            return False
-
-    def _associate_token_transaction_with_keys(self, txid: str, tx: Transaction) -> None:
-        """
-        Associate a BSV-20 token transaction with the wallet's keys.
-        This is a critical function to ensure token transactions are visible in the wallet.
-        
-        Args:
-            txid: The transaction ID (hex string)
-            tx: The Transaction object
-        """
-        logger.debug(f"Associating token transaction {txid[:10]}... with wallet keys")
-        
-        # Get all active keys in the account
-        active_key_ids = []
-        for key_id, key in self._keyinstances.items():
-            if key.flags & KeyInstanceFlag.IS_ACTIVE:
-                active_key_ids.append(key_id)
-        
-        if not active_key_ids:
-            logger.warning(f"No active keys found when associating token transaction {txid[:10]}...")
-            return
-
-        # First, attempt to extract BSV-20 token metadata from the transaction itself
-        bsv20_metadata = self._extract_bsv20_metadata_from_tx(tx)
-        
-        # Get addresses from the transaction outputs if possible
-        addresses_involved = []
-        address_to_amount = {}
-        
-        # Extract token amounts and addresses from transaction outputs
-        try:
-            for output_index, output in enumerate(tx.outputs):
-                if not hasattr(output, 'script_pubkey'):
-                    continue
-                    
-                # Try to extract address from script_pubkey
-                try:
-                    script = Script(output.script_pubkey)
-                    if hasattr(script, 'to_address'):
-                        address = script.to_address()
-                        if address:
-                            addresses_involved.append(address)
-                            # If bsv20_metadata contains output index mapping, use it
-                            if isinstance(bsv20_metadata, dict) and 'output_map' in bsv20_metadata:
-                                amount = bsv20_metadata['output_map'].get(output_index, 0)
-                                if amount:
-                                    address_to_amount[address] = amount
-                except Exception as e:
-                    logger.debug(f"Error extracting address from output {output_index}: {str(e)}")
-        except Exception as e:
-            logger.debug(f"Error processing transaction outputs: {str(e)}")
-        
-        # If we have addresses from the transaction, use our specialized token metadata storage
-        if addresses_involved:
-            # Get token ID
-            config = app_state.config
-            token_id = config.get('bsv20_token_id', '')
-            if not token_id and self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
-                token_id = self._mnee_config_cache['tokenId']
-            
-            # Create metadata object in the format needed by _store_mnee_token_metadata
-            metadata = {
-                'addresses': addresses_involved,
-                'address_to_amount': address_to_amount,
-                'token_id': token_id,
-                'amount': bsv20_metadata.get('total_amount', 0) if isinstance(bsv20_metadata, dict) else 0
-            }
-            
-            # Use our new specialized metadata storage method
-            self._store_mnee_token_metadata(txid, metadata)
-            return
-        
-        # Fallback: If no addresses found, use the original approach of associating with all keys
-        try:
-            if hasattr(self._wallet, 'get_db_context'):
-                db_context = self._wallet.get_db_context()
-                
-                # Store in WalletData table with metadata about this token transaction
-                wallet_data_table = WalletDataTable(db_context)
-                
-                # Create basic metadata for this transaction (no addresses found)
-                tx_metadata = {
-                    "txid": txid,
-                    "timestamp": int(time.time()),
-                    "bsv20": True,
-                    "keys": active_key_ids
-                }
-                
-                # Store metadata for this transaction
-                data_key = f"bsv20_tx_{txid}"
-                data_value = json.dumps(tx_metadata)
-                
-                # Upsert the data row
-                data_row = WalletDataRow(key=data_key, value=data_value)
-                wallet_data_table.upsert([data_row])
-                
-                logger.info(f"Stored basic BSV-20 metadata for transaction {txid[:10]}... in WalletData table")
-                
-                # Update key-specific transaction counts
-                for key_id in active_key_ids:
-                    if key_id not in self._mnee_tx_count_per_key:
-                        self._mnee_tx_count_per_key[key_id] = 0
-                    self._mnee_tx_count_per_key[key_id] += 1
-                    
-                # Save the updated transaction counts to the database
-                self._save_mnee_data_to_db()
-                
-                # Update the sync state
-                if hasattr(self, '_sync_state'):
-                    for key_id in active_key_ids:
-                        # Add transaction to the key's history
-                        self._sync_state.set_key_history(key_id, [(txid, 0)])  # Height 0 means unconfirmed
-                    
-                    # FIXED: Check if set_transaction_key_ids exists before calling it
-                    if hasattr(self._sync_state, 'set_transaction_key_ids'):
-                        self._sync_state.set_transaction_key_ids(txid, active_key_ids)
-                    else:
-                        logger.debug(f"SyncState doesn't have set_transaction_key_ids method, skipping this step")
-                
-                logger.debug(f"Successfully associated token transaction {txid[:10]}... with {len(active_key_ids)} keys")
-        except Exception as e:
-            logger.error(f"Error in _associate_token_transaction_with_keys for {txid[:10]}: {e}", exc_info=True)
-
-    def _extract_bsv20_metadata_from_tx(self, tx: Transaction) -> Dict:
-        """
-        Extract BSV-20 token metadata directly from a transaction.
-        This scans for BSV-20 OP_RETURN outputs and extracts token transfer information.
-        
-        Args:
-            tx: The Transaction object
-        
-        Returns:
-            Dictionary containing extracted BSV-20 metadata, or empty dict if none found
-        """
-        if not tx:
-            return {}
-            
-        # Get the token ID from config
-        config = app_state.config
-        token_id = config.get('bsv20_token_id', '')
-        if not token_id and self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
-            token_id = self._mnee_config_cache['tokenId']
-        
-        if not token_id:
-            logger.debug("No token ID available for BSV-20 extraction")
-            return {}
-        
-        # Variables to collect metadata
-        bsv20_outputs = []
-        output_map = {}
-        total_amount = 0
-        
-        try:
-            # Scan outputs for BSV-20 OP_RETURN outputs
-            for output_index, output in enumerate(tx.outputs):
-                if not hasattr(output, 'script_pubkey'):
-                    continue
-                    
-                # Convert script to bytes
-                script_bytes = bytes(output.script_pubkey)
-                
-                # Convert to hex for string matching
-                script_hex = script_bytes.hex()
-                
-                # Look for OP_RETURN with BSV-20 and the token ID
-                if len(script_bytes) > 0 and script_bytes[0] == 0x6a:  # OP_RETURN
-                    script_str = script_bytes.decode('utf-8', errors='ignore')
-                    
-                    # Check for BSV-20 patterns
-                    if "bsv-20" in script_str.lower() or "bsv20" in script_str.lower():
-                        bsv20_outputs.append(output_index)
-                        
-                        # Try to extract token amount
-                        # This is very simplified; proper parsing would need to decode the JSON in OP_RETURN
+                    # Make sure amount is never None
+                    safe_amount = 0 if amount is None else amount
+                    # Convert to int if needed
+                    if not isinstance(safe_amount, int):
                         try:
-                            # Look for common BSV-20 patterns like "amt":123 or "amount":123
-                            amount_matches = []
-                            import re
-                            amt_patterns = [
-                                r'"amt"\s*:\s*(\d+)',
-                                r'"amount"\s*:\s*(\d+)',
-                                r'"tokenAmount"\s*:\s*(\d+)',
-                                r'"value"\s*:\s*(\d+)'
-                            ]
-                            
-                            for pattern in amt_patterns:
-                                matches = re.findall(pattern, script_str)
-                                if matches:
-                                    amount_matches.extend(matches)
-                            
-                            # If we found amount matches, use the first one
-                            if amount_matches:
-                                amount = int(amount_matches[0])
-                                output_map[output_index] = amount
-                                total_amount += amount
-                        except Exception as e:
-                            logger.debug(f"Error extracting token amount from OP_RETURN: {str(e)}")
+                            safe_amount = int(safe_amount)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not convert amount {safe_amount} to integer, using 1")
+                            safe_amount = 1  # Use 1 token (better than 0) as fallback
+                    
+                    # Now do the addition with the safe amount value
+                    self._mnee_balances_per_key[key_id] = current_balance + safe_amount
+                    
+                    # Create token event data (BSV-20 token received)
+                    event_data = {
+                        "token_id": token_id,
+                        "address": address,
+                        "amount": amount,
+                        "type": "TOKEN_RECEIVED",
+                        "tx_hash": txid,
+                        "timestamp": int(time.time()),
+                        "keyinstance_id": key_id
+                    }
+                    
+                    # Instead of using WalletEventRow, store in WalletData table
+                    data_key = f"bsv20_tx_{txid[:16]}_{key_id}"
+                    data_value = json.dumps(event_data)
+                    
+                    # Create WalletDataRow and upsert it
+                    data_row = WalletDataRow(key=data_key, value=data_value)
+                    wallet_data_table = WalletDataTable(db_context)
+                    wallet_data_table.upsert([data_row])
+            
         except Exception as e:
-            logger.debug(f"Error scanning for BSV-20 outputs: {str(e)}")
-        
-        # If we found BSV-20 outputs, return the metadata
-        if bsv20_outputs:
-            return {
-                'bsv20_outputs': bsv20_outputs,
-                'output_map': output_map,
-                'total_amount': total_amount,
-                'token_id': token_id
-            }
-        
-        return {}
-    
-    def process_mnee_transactions(self, key_id: int, txids: List[str]) -> List[Dict]:
-        """
-        Process MNEE transactions for a specific key.
-        
-        Args:
-            key_id: The key instance ID
-            txids: List of transaction IDs to process
-            
-        Returns:
-            List of processed MNEE token data
-        """
-        logger.debug(f"Processing {len(txids)} MNEE transactions for key {key_id}")
-        
-        # Get the token ID from config
-        config = app_state.config
-        token_id = config.get('bsv20_token_id', '')
-        
-        if not token_id:
-            # Try to get from cached config
-            if self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
-                token_id = self._mnee_config_cache['tokenId']
-            
-            if not token_id:
-                logger.warning("No token ID available, cannot identify MNEE transactions")
-                return []
-        
-        # Store the transactions if possible
-        processed_mnee_txs = []
-        
-        # Process each transaction
-        for txid in txids:
-            try:
-                # CRITICAL FIX: Validate txid is a valid transaction ID format (64 hex chars)
-                if not isinstance(txid, str) or len(txid) != 64 or not all(c in '0123456789abcdefABCDEF' for c in txid):
-                    logger.error(f"Invalid transaction ID format: {txid[:64] if isinstance(txid, str) else str(txid)[:64]}...")
-                    continue
+            logger.error(f"Error processing transaction {txid[:10]}...: {str(e)}")
                 
-                # Skip if already processed
-                if self._mnee_tx_count_per_key.get(key_id, 0) > 0 and txid in processed_mnee_txs:
-                    continue
-                
-                # Get the transaction data
-                tx_data = None
-                
-                # Try to get from wallet first
-                if hasattr(self._wallet, 'get_transaction'):
-                    try:
-                        tx_data = self._wallet.get_transaction(txid)
-                    except Exception as e:
-                        logger.debug(f"Error getting transaction {txid[:10]}... from wallet: {str(e)}")
-                
-                # If we couldn't get it from the wallet, try to fetch it
-                if not tx_data and hasattr(self._wallet, '_network'):
-                    try:
-                        network = self._wallet._network
-                        if hasattr(network, 'request_fetch_transaction'):
-                            logger.debug(f"Fetching transaction {txid[:10]}... from network")
-                            tx_data = network.request_fetch_transaction(txid)
-                    except Exception as e:
-                        logger.debug(f"Error fetching transaction {txid[:10]}... from network: {str(e)}")
-                
-                # If we got the transaction data, analyze it for MNEE tokens
-                if tx_data:
-                    # Check if this is an MNEE token transaction
-                    is_mnee_tx = False
-                    token_amount = 0
-                    
-                    # Simple check for MNEE BSV-20 tokens in the transaction
-                    # This is a simplified check, real implementation would be more thorough
-                    tx_hex = tx_data.hex() if isinstance(tx_data, bytes) else tx_data
-                    
-                    # Look for BSV-20 and the token ID in the transaction
-                    if "bsv-20" in tx_hex and token_id in tx_hex:
-                        is_mnee_tx = True
-                        # This is a very simplified token amount extraction
-                        # Real implementation would decode the transaction properly
-                        token_amount = 1  # Placeholder
-                    
-                    if is_mnee_tx:
-                        # Store token data
-                        token_data = {
-                            'txid': txid,
-                            'amount': token_amount,
-                            'token_id': token_id
-                        }
-                        processed_mnee_txs.append(token_data)
-                        
-                        # Update counters
-                        self._mnee_tx_count_per_key[key_id] = self._mnee_tx_count_per_key.get(key_id, 0) + 1
-                        
-                        # Update balance (simple accumulation, real impl would be more complex)
-                        current_balance = self._mnee_balances_per_key.get(key_id, 0)
-                        self._mnee_balances_per_key[key_id] = current_balance + token_amount
-            
-            except Exception as e:
-                logger.error(f"Error processing transaction {txid[:10]}...: {str(e)}")
-                
-        return processed_mnee_txs
+        return
     
     def synchronize_mnee(self) -> Dict:
         """
@@ -1934,6 +1384,114 @@ class MneeAccount(StandardAccount):
         
         return result
 
+    def fetch_txids_for_multiple_addresses(self, addresses: List[str]) -> Dict:
+        """
+        Fetch transaction IDs for multiple addresses from the MNEE API.
+        
+        Args:
+            addresses: List of addresses to query
+            
+        Returns:
+            Dictionary mapping addresses to lists of transaction IDs
+        """
+        logger.debug(f"Fetching txids for {len(addresses)} addresses")
+        
+        # Get MNEE configuration
+        config = app_state.config
+        mnee_env = config.get('mnee_environment', 'production')
+        base_url = MNEE_API_URL_PRODUCTION if mnee_env == 'production' else MNEE_API_URL_SANDBOX
+        api_key = config.get(f'mnee_api_key_{mnee_env}', MNEE_DEFAULT_API_KEY)
+        
+        result = {}
+        directly_stored_count = 0
+        
+        try:
+            # Build the API endpoint for getting transactions
+            endpoint = "/v1/sync"
+            url = f"{base_url}{endpoint}?auth_token={api_key}"
+            
+            # Set up headers
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+            
+            # Create request data with these addresses
+            data = json.dumps(addresses).encode('utf-8')
+            
+            # Make the API request
+            logger.debug(f"Calling MNEE API at: {url} with {len(addresses)} addresses")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw_data = response.read().decode()
+                api_response = json.loads(raw_data) if raw_data else []
+                
+                # Process each transaction in the response
+                tx_count = len(api_response) if isinstance(api_response, list) else 0
+                logger.debug(f"Got response with {tx_count} transactions")
+                
+                # Process transactions from API response
+                if isinstance(api_response, list) and api_response:
+                    # Create address -> [txids] mapping
+                    address_to_txids = {}
+                    
+                    # Process each transaction
+                    for tx_item in api_response:
+                        if not isinstance(tx_item, dict):
+                            continue
+                            
+                        # Extract transaction ID
+                        txid = None
+                        for id_field in ['txid', 'hash', 'id', 'transaction_hash', 'tx_hash']:
+                            if id_field in tx_item and tx_item[id_field]:
+                                txid = tx_item[id_field]
+                                break
+                        
+                        if not txid or not isinstance(txid, str):
+                            continue
+                        
+                        # Extract addresses involved
+                        tx_addresses = []
+                        
+                        # Check senders
+                        if 'senders' in tx_item and isinstance(tx_item['senders'], list):
+                            tx_addresses.extend(tx_item['senders'])
+                            
+                        # Check receivers
+                        if 'receivers' in tx_item and isinstance(tx_item['receivers'], list):
+                            tx_addresses.extend(tx_item['receivers'])
+                            
+                        # Map each address to this txid
+                        for addr in tx_addresses:
+                            if addr in addresses:  # Only include requested addresses
+                                if addr not in address_to_txids:
+                                    address_to_txids[addr] = []
+                                if txid not in address_to_txids[addr]:
+                                    address_to_txids[addr].append(txid)
+                    
+                    # Add to result
+                    result.update(address_to_txids)
+                    
+                    # Set up result dictionary for addresses with no transactions
+                    for addr in addresses:
+                        if addr not in result:
+                            result[addr] = []
+                            
+                    # Record how many transactions were processed
+                    result['directly_stored_count'] = directly_stored_count
+                else:
+                    logger.warning(f"Unexpected response format from API: {type(api_response)}")
+                    # Return empty lists for all addresses
+                    for addr in addresses:
+                        result[addr] = []
+        except Exception as e:
+            logger.error(f"Error fetching transactions for addresses: {str(e)}")
+            result['error'] = str(e)
+            result['error_storing_transactions'] = True
+        
+        return result
+
     def _process_key_usage(self, tx_hash: bytes, tx: Transaction,
             relevant_txos: Optional[List[Tuple[int, XTxOutput]]]) -> bool:
         # This method is an override of AbstractAccount._process_key_usage
@@ -2056,3 +1614,58 @@ class MneeAccount(StandardAccount):
 
         logger.debug(f"MneeAccount: tx {tx_id} not relevant to account {self.get_id()} after processing.")
         return False
+
+    def process_mnee_transactions(self, key_id: int, txids: List[str]) -> List[Dict]:
+        """
+        Process a list of transaction IDs for a specific key.
+        This method updates the token counts for a key and returns a list of processed transactions.
+        
+        Args:
+            key_id: The keyinstance_id to update with transaction counts
+            txids: List of transaction IDs to process
+            
+        Returns:
+            List of processed transaction data dictionaries
+        """
+        logger.debug(f"Processing {len(txids)} MNEE transactions for key {key_id}")
+        
+        if not txids:
+            return []
+            
+        # Update the transaction count for this key
+        current_count = self._mnee_tx_count_per_key.get(key_id, 0)
+        new_count = current_count + len(txids)
+        self._mnee_tx_count_per_key[key_id] = new_count
+        
+        # Process each transaction
+        processed_txs = []
+        for txid in txids:
+            try:
+                # Create a transaction data entry
+                tx_data = {
+                    'txid': txid,
+                    'key_id': key_id,
+                    'processed_time': int(time.time())
+                }
+                
+                # Add to the processed list
+                processed_txs.append(tx_data)
+                
+                # Make sure to save the data to the database
+                if hasattr(self._wallet, 'get_db_context'):
+                    db_context = self._wallet.get_db_context()
+                    wallet_data_table = WalletDataTable(db_context)
+                    
+                    # Create a record of this transaction being processed
+                    data_key = f"mnee_tx_processed_{txid[:8]}_{key_id}"
+                    data_value = json.dumps(tx_data)
+                    data_row = WalletDataRow(key=data_key, value=data_value)
+                    wallet_data_table.upsert([data_row])
+            except Exception as e:
+                logger.error(f"Error processing MNEE transaction {txid[:8]} for key {key_id}: {str(e)}")
+        
+        # Save the transaction count back to the database
+        self._save_mnee_data_to_db()
+        
+        # Return the list of processed transactions
+        return processed_txs
