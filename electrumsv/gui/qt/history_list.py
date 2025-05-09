@@ -595,12 +595,14 @@ class HistoryList(MyTreeWidget):
                 else:
                     logger.warning("Account doesn't have _mnee_tx_count_per_key attribute. MNEE transaction counting won't work.")
                 
-        # Save all updated transaction counts to the database in one go
+        # If this is a MNEE account, persist transaction counts to database
         if hasattr(self._account, '_save_mnee_data_to_db'):
-            logger.debug("Saving updated MNEE transaction counts to storage")
-            self._account._save_mnee_data_to_db()
+            try:
+                self._account._save_mnee_data_to_db()
+            except Exception as e:
+                logger.warning(f"Error saving MNEE transaction data: {str(e)}")
         else:
-            logger.warning("Account doesn't have _save_mnee_data_to_db method. MNEE transaction counts won't be persisted.")
+            logger.debug("Account doesn't have _save_mnee_data_to_db method. MNEE transaction counts won't be persisted.")
                 
         # Check for keys with no UTXOs but with transactions - candidates for archiving
         for keyinstance_id, count in tx_counts_by_key.items():

@@ -92,32 +92,32 @@ class MneeAccount(StandardAccount):
             
         try:
             db_context = self._wallet.get_db_context()
-            wallet_data_table = WalletDataTable(db_context)
-            
-            # Get all wallet data rows - we'll filter ourselves
-            key_prefix = "mnee_key_data_"
-            rows = wallet_data_table.read()
-            
-            # Filter only rows with our prefix
-            matching_rows = [row for row in rows if row.key.startswith(key_prefix)]
-            
-            for row in matching_rows:
-                try:
-                    key_id_str = row.key[len(key_prefix):]
-                    key_id = int(key_id_str)
-                    
-                    # Parse the JSON data
-                    data_dict = json.loads(row.value)
-                    
-                    # Load token count and balance
-                    if 'tx_count' in data_dict:
-                        self._mnee_tx_count_per_key[key_id] = data_dict['tx_count']
-                    if 'balance' in data_dict:
-                        self._mnee_balances_per_key[key_id] = data_dict['balance']
+            # Use a context manager to ensure the table connection is properly closed
+            with WalletDataTable(db_context) as wallet_data_table:
+                # Get all wallet data rows - we'll filter ourselves
+                key_prefix = "mnee_key_data_"
+                rows = wallet_data_table.read()
+                
+                # Filter only rows with our prefix
+                matching_rows = [row for row in rows if row.key.startswith(key_prefix)]
+                
+                for row in matching_rows:
+                    try:
+                        key_id_str = row.key[len(key_prefix):]
+                        key_id = int(key_id_str)
                         
-                    logger.debug(f"Loaded MNEE data for key {key_id}: tx_count={data_dict.get('tx_count', 0)}, balance={data_dict.get('balance', 0)}")
-                except Exception as row_error:
-                    logger.debug(f"Error parsing MNEE data row {row.key}: {str(row_error)}")
+                        # Parse the JSON data
+                        data_dict = json.loads(row.value)
+                        
+                        # Load token count and balance
+                        if 'tx_count' in data_dict:
+                            self._mnee_tx_count_per_key[key_id] = data_dict['tx_count']
+                        if 'balance' in data_dict:
+                            self._mnee_balances_per_key[key_id] = data_dict['balance']
+                            
+                        logger.debug(f"Loaded MNEE data for key {key_id}: tx_count={data_dict.get('tx_count', 0)}, balance={data_dict.get('balance', 0)}")
+                    except Exception as row_error:
+                        logger.debug(f"Error parsing MNEE data row {row.key}: {str(row_error)}")
             
             logger.info(f"Loaded MNEE data for {len(matching_rows)} keys from WalletData table.")
         except Exception as e:
@@ -262,6 +262,46 @@ class MneeAccount(StandardAccount):
         """
         return self._mnee_balances_per_key.get(key_id, 0)
     
+    def get_mnee_balance(self) -> int:
+        """
+        Get the total MNEE token balance for the entire account.
+
+        Returns:
+            The total MNEE token balance for the account.
+        """
+        return sum(self._mnee_balances_per_key.values())
+    
+    def get_formatted_mnee_balance(self, config) -> Tuple[str, str]:
+        """
+        Get the formatted MNEE token balance for display in the UI.
+        
+        Args:
+            config: The application configuration
+            
+        Returns:
+            Tuple of (formatted_balance_string, unit_string)
+        """
+        balance = self.get_mnee_balance()
+        
+        # Get MNEE configuration if available
+        decimals = 0
+        unit = "MNEE"
+        
+        # Try to get decimals from cached config
+        mnee_config = self._mnee_config_cache
+        if mnee_config and 'decimals' in mnee_config:
+            decimals = mnee_config['decimals']
+        
+        if decimals > 0:
+            # Convert from atomic units to display units
+            display_balance = balance / (10 ** decimals)
+            balance_str = f"{display_balance:.{decimals}f}"
+        else:
+            # No decimals, use atomic units directly
+            balance_str = f"{balance}"
+            
+        return balance_str, unit
+    
     def diagnostic_report(self) -> Dict:
         """
         Generate a diagnostic report of the account state.
@@ -332,6 +372,7 @@ class MneeAccount(StandardAccount):
                         report['transactions_stored'] = count
                 else:
                     # Fallback to direct cursor if executor is not available
+                    cursor = None # Initialize cursor
                     try:
                         cursor = db.cursor() if hasattr(db, 'cursor') else db.connection.cursor()
                         count_query = """
@@ -344,10 +385,13 @@ class MneeAccount(StandardAccount):
                             )
                         """
                         cursor.execute(count_query, (self.get_id(),))
-                        count = cursor.fetchone()[0]
-                        report['transactions_stored'] = count
+                        count_result = cursor.fetchone()
+                        report['transactions_stored'] = count_result[0] if count_result else 0
                     except Exception as cursor_error:
                         logger.debug(f"Error counting transactions with cursor: {str(cursor_error)}")
+                    finally:
+                        if cursor:
+                            cursor.close()
             except Exception as e:
                 logger.debug(f"Error counting transactions: {str(e)}")
         
@@ -415,35 +459,79 @@ class MneeAccount(StandardAccount):
         """
         Save MNEE token data to the wallet database using WalletData table.
         """
-        if not hasattr(self, '_wallet') or not hasattr(self._wallet, 'get_db_context'):
-            logger.warning("Cannot save MNEE data: wallet or db_context getter not available")
-            return
-            
         try:
-            db_context = self._wallet.get_db_context()
-            wallet_data_table = WalletDataTable(db_context)
-            
-            rows_to_upsert = []
-            for key_id, count in self._mnee_tx_count_per_key.items():
-                balance = self._mnee_balances_per_key.get(key_id, 0)
-                data_value_dict = {
-                    'tx_count': count,
-                    'balance': balance
-                }
-                data_key = f"mnee_key_data_{key_id}"
-                data_value_json = json.dumps(data_value_dict)
+            # First check if _wallet is available
+            if not hasattr(self, '_wallet'):
+                logger.debug("Cannot save MNEE data: wallet reference not available")
+                return
                 
-                rows_to_upsert.append(WalletDataRow(key=data_key, value=data_value_json))
-                logger.debug(f"Prepared MNEE data for key {key_id}: tx_count={count}, balance={balance}")
-            
-            if rows_to_upsert:
-                wallet_data_table.upsert(rows_to_upsert)
-                logger.info(f"Saved/Updated MNEE data for {len(rows_to_upsert)} keys to WalletData table.")
-            else:
-                logger.debug("No MNEE key data to save to WalletData table.")
-
+            # Use a safer approach to check whether wallet is valid
+            wallet = None
+            try:
+                wallet = self._wallet
+                if wallet is None or hasattr(wallet, '_stopped') and wallet._stopped:
+                    logger.debug("Cannot save MNEE data: wallet is stopped or None")
+                    return
+            except ReferenceError:
+                logger.debug("Cannot save MNEE data: wallet reference is no longer valid")
+                return
+                
+            # Ensure db_context is available
+            if not hasattr(wallet, 'get_db_context'):
+                logger.debug("Cannot save MNEE data: get_db_context not available on wallet")
+                return
+                
+            # Get database context
+            db_context = wallet.get_db_context()
+            if db_context is None:
+                logger.debug("Cannot save MNEE data: db_context is None")
+                return
+                
+            # Nothing to save, skip
+            if not self._mnee_tx_count_per_key:
+                logger.debug("No MNEE token data to save")
+                return
+                
+            # Now save data
+            with WalletDataTable(db_context) as wallet_data_table:
+                # Read all existing records to check if we need to update or create
+                existing_data = wallet_data_table.read()
+                existing_keys = {row.key: row for row in existing_data}
+                
+                rows_to_create = []
+                rows_to_update = []
+                
+                for key_id, count in self._mnee_tx_count_per_key.items():
+                    balance = self._mnee_balances_per_key.get(key_id, 0)
+                    data_value_dict = {
+                        'tx_count': count,
+                        'balance': balance
+                    }
+                    data_value = json.dumps(data_value_dict)
+                    
+                    # Use a prefix to identify MNEE-related records
+                    key = f"mnee_key_data_{key_id}"
+                    
+                    # Check if the row already exists
+                    if key in existing_keys:
+                        # Update existing row
+                        rows_to_update.append(WalletDataRow(key=key, value=data_value))
+                    else:
+                        # Insert new row
+                        rows_to_create.append(WalletDataRow(key=key, value=data_value))
+                        
+                # Perform updates
+                if rows_to_create:
+                    wallet_data_table.create(rows_to_create)
+                    logger.debug(f"Created {len(rows_to_create)} new MNEE token data records")
+                if rows_to_update:
+                    wallet_data_table.update(rows_to_update)
+                    logger.debug(f"Updated {len(rows_to_update)} existing MNEE token data records")
+                    
+                logger.debug(f"Saved MNEE data for {len(self._mnee_tx_count_per_key)} keys to WalletData table.")
         except Exception as e:
-            logger.error(f"Error saving MNEE key data to WalletData: {e}", exc_info=True)
+            logger.error(f"Error saving MNEE data to database: {str(e)}")
+            # Continue without saving - will try again next time
     
     def synchronize(self) -> int:
         """Synchronizes the account with the blockchain and MNEE API.
@@ -1009,57 +1097,58 @@ class MneeAccount(StandardAccount):
         
         # Store metadata in WalletEvent table (standard ElectrumSV approach)
         try:
-            if hasattr(self._wallet, 'get_db_context'):
+            if hasattr(self, '_wallet') and hasattr(self._wallet, 'get_db_context'):
                 db_context = self._wallet.get_db_context()
                 
-                # Use WalletEventTable for storing token events (standard approach)
-                wallet_event_table = WalletEventTable(db_context)
-                
-                # For each address that has a matching key in our wallet
-                for address, key_id in address_to_key_map.items():
-                    # Get amount for this address if available 
-                    amount = metadata.get('address_to_amount', {}).get(address, metadata.get('amount', 0))
-                    
-                    # Make sure amount is never None
-                    safe_amount = 0 if amount is None else amount
-                    # Convert to int if needed
-                    if not isinstance(safe_amount, int):
-                        try:
-                            safe_amount = int(safe_amount)
-                        except (ValueError, TypeError):
-                            logger.warning(f"Could not convert amount {safe_amount} to integer, using 1")
-                            safe_amount = 1  # Use 1 token (better than 0) as fallback
-                    
-                    # Now do the addition with the safe amount value
-                    self._mnee_balances_per_key[key_id] = current_balance = self._mnee_balances_per_key.get(key_id, 0) + safe_amount
-                    
-                    # Create token event data (BSV-20 token received)
-                    event_data = {
-                        "token_id": token_id,
-                        "address": address,
-                        "amount": safe_amount,  # Use safe_amount here too
-                        "type": "TOKEN_RECEIVED",
-                        "tx_hash": txid,
-                        "timestamp": int(time.time()),
-                        "keyinstance_id": key_id
-                    }
-                    
-                    # Instead of using WalletEventRow, store in WalletData table
-                    data_key = f"bsv20_tx_{txid[:16]}_{key_id}"
-                    data_value = json.dumps(event_data)
-                    
-                    # Create WalletDataRow and upsert it
-                    data_row = WalletDataRow(key=data_key, value=data_value)
-                    wallet_data_table = WalletDataTable(db_context)
-                    wallet_data_table.upsert([data_row])
-                    
-                    # REGISTER THIS TRANSACTION IN THE STANDARD HISTORY
-                    # This ensures it appears in standard transaction listings
-                    # Pass event_data which includes the safe_amount we calculated
-                    self._register_transaction_for_key(txid, key_id, event_data)
+                # Use WalletDataTable for storing token events (standard approach)
+                with WalletDataTable(db_context) as wallet_data_table: # Use context manager
+                    # For each address that has a matching key in our wallet
+                    for address, key_id in address_to_key_map.items():
+                        # Get amount for this address if available 
+                        amount = metadata.get('address_to_amount', {}).get(address, metadata.get('amount', 0))
+                        
+                        # Make sure amount is never None
+                        safe_amount = 0 if amount is None else amount
+                        # Convert to int if needed
+                        if not isinstance(safe_amount, int):
+                            try:
+                                safe_amount = int(safe_amount)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not convert amount {safe_amount} to integer, using 1")
+                                safe_amount = 1  # Use 1 token (better than 0) as fallback
+                        
+                        # Now do the addition with the safe amount value
+                        self._mnee_balances_per_key[key_id] = self._mnee_balances_per_key.get(key_id, 0) + safe_amount
+                        
+                        # Create token event data (BSV-20 token received)
+                        event_data = {
+                            "token_id": token_id,
+                            "address": address,
+                            "amount": safe_amount,  # Use safe_amount here too
+                            "type": "TOKEN_RECEIVED",
+                            "tx_hash": txid,
+                            "timestamp": int(time.time()),
+                            "keyinstance_id": key_id
+                        }
+                        
+                        # Instead of using WalletEventRow, store in WalletData table
+                        data_key = f"bsv20_tx_{txid[:16]}_{key_id}"
+                        data_value = json.dumps(event_data)
+                        
+                        # Create WalletDataRow and upsert it
+                        data_row = WalletDataRow(key=data_key, value=data_value)
+                        wallet_data_table.upsert([data_row]) # Upsert within the context
+                        
+                        # REGISTER THIS TRANSACTION IN THE STANDARD HISTORY
+                        # This ensures it appears in standard transaction listings
+                        # Pass event_data which includes the safe_amount we calculated
+                        self._register_transaction_for_key(txid, key_id, event_data)
                 
                 # Save the updated transaction counts and balances to the database
-                self._save_mnee_data_to_db()
+                try:
+                    self._save_mnee_data_to_db() # This method now also uses context manager
+                except Exception as e:
+                    logger.warning(f"Error saving MNEE data after storing token metadata: {str(e)}")
                     
                 # Only need the fallback sync_state registration if register_transaction_for_key failed
                 if hasattr(self, '_sync_state'):
@@ -1080,6 +1169,36 @@ class MneeAccount(StandardAccount):
                 
         return
     
+    def stop(self) -> None:
+        """
+        Clean up resources when wallet is closing.
+        Ensures all database connections are properly closed.
+        """
+        logger.debug("Cleaning up MNEE token resources")
+        
+        # Save any unsaved data - do this before clearing wallet reference
+        if hasattr(self, '_mnee_tx_count_per_key') and self._mnee_tx_count_per_key:
+            logger.debug("Saving MNEE data during shutdown")
+            try:
+                self._save_mnee_data_to_db()
+            except Exception as e:
+                logger.error(f"Error saving MNEE data during shutdown: {str(e)}")
+            
+        # Clear references that might hold database connections
+        self._wallet = None
+
+    def close(self):
+        """
+        Handle proper cleanup when the account is closed.
+        """
+        # Call the parent class close method if it exists
+        super().close()
+        
+        # Clean up MneeTokenMixin resources
+        self.stop()
+        
+        logger.debug(f"MNEE account {self.get_id()} closed and resources cleaned up.")
+
     def synchronize_mnee(self) -> Dict:
         """
         Synchronize MNEE data for this account.
@@ -1851,6 +1970,15 @@ class MneeAccount(StandardAccount):
                                 lambda ki_ids: None  # No request checking needed
                             )
                             
+                            # Update transaction count for this key
+                            self._mnee_tx_count_per_key[key_id] = self._mnee_tx_count_per_key.get(key_id, 0) + 1
+                            
+                            # Save updated transaction counts to database
+                            try:
+                                self._save_mnee_data_to_db()
+                            except Exception as save_error:
+                                logger.warning(f"Error saving MNEE data after registering tx: {str(save_error)}")
+                            
                             logger.debug(f"Created transaction delta record for token tx {txid[:8]} amount={mnee_amount}")
                         except Exception as delta_error:
                             logger.error(f"Error creating transaction delta: {str(delta_error)}")
@@ -2005,3 +2133,133 @@ class MneeAccount(StandardAccount):
             logger.debug(f"Error extracting BSV-20 metadata from transaction: {str(e)}")
             
         return result
+
+    def _store_mnee_token_metadata(self, txid: str, metadata: Dict) -> None:
+        """
+        Store MNEE token metadata for a transaction in the wallet database.
+        This links the transaction with wallet keys that own the addresses involved.
+        Uses standard ElectrumSV patterns for storing transaction metadata.
+        
+        Args:
+            txid: The transaction ID
+            metadata: Dictionary containing token metadata
+        """
+        logger.debug(f"Storing MNEE token metadata for transaction {txid[:10]}")
+        
+        addresses = metadata.get('addresses', [])
+        if not addresses:
+            logger.debug(f"No addresses in metadata for transaction {txid[:10]}")
+            return
+        
+        # Find keys corresponding to these addresses
+        address_to_key_map = {}
+        for key_id, key in self._keyinstances.items():
+            if not (key.flags & KeyInstanceFlag.IS_ACTIVE):
+                continue
+                
+            try:
+                # FIXED: Check if the key has a valid script type before trying to get script
+                from electrumsv.constants import ScriptType
+                if key.script_type == ScriptType.NONE:
+                    logger.debug(f"Skipping key_id {key_id} with ScriptType.NONE in _store_mnee_token_metadata")
+                    continue
+                    
+                script_template = self.get_script_template_for_id(key_id)
+                if hasattr(script_template, 'to_string'):
+                    address = script_template.to_string()
+                    if address and address in addresses:
+                        address_to_key_map[address] = key_id
+            except Exception as e:
+                logger.debug(f"Error getting address for key {key_id}: {str(e)}")
+        
+        if not address_to_key_map:
+            logger.debug(f"No matching wallet keys found for addresses in transaction {txid[:10]}")
+            return
+        
+        logger.info(f"Found {len(address_to_key_map)} matching wallet keys for transaction {txid[:10]}")
+        
+        # Get token amount information
+        token_id = metadata.get('token_id', '')
+        if not token_id:
+            config = app_state.config
+            token_id = config.get('bsv20_token_id', '')
+            if not token_id and self._mnee_config_cache and 'tokenId' in self._mnee_config_cache:
+                token_id = self._mnee_config_cache['tokenId']
+        
+        # Convert txid to bytes
+        tx_hash_bytes = hex_str_to_hash(txid)
+        
+        # Store metadata in WalletEvent table (standard ElectrumSV approach)
+        try:
+            if hasattr(self, '_wallet') and hasattr(self._wallet, 'get_db_context'):
+                db_context = self._wallet.get_db_context()
+                
+                # Use WalletDataTable for storing token events (standard approach)
+                with WalletDataTable(db_context) as wallet_data_table: # Use context manager
+                    # For each address that has a matching key in our wallet
+                    for address, key_id in address_to_key_map.items():
+                        # Get amount for this address if available 
+                        amount = metadata.get('address_to_amount', {}).get(address, metadata.get('amount', 0))
+                        
+                        # Make sure amount is never None
+                        safe_amount = 0 if amount is None else amount
+                        # Convert to int if needed
+                        if not isinstance(safe_amount, int):
+                            try:
+                                safe_amount = int(safe_amount)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not convert amount {safe_amount} to integer, using 1")
+                                safe_amount = 1  # Use 1 token (better than 0) as fallback
+                        
+                        # Now do the addition with the safe amount value
+                        self._mnee_balances_per_key[key_id] = self._mnee_balances_per_key.get(key_id, 0) + safe_amount
+                        
+                        # Create token event data (BSV-20 token received)
+                        event_data = {
+                            "token_id": token_id,
+                            "address": address,
+                            "amount": safe_amount,  # Use safe_amount here too
+                            "type": "TOKEN_RECEIVED",
+                            "tx_hash": txid,
+                            "timestamp": int(time.time()),
+                            "keyinstance_id": key_id
+                        }
+                        
+                        # Instead of using WalletEventRow, store in WalletData table
+                        data_key = f"bsv20_tx_{txid[:16]}_{key_id}"
+                        data_value = json.dumps(event_data)
+                        
+                        # Create WalletDataRow and upsert it
+                        data_row = WalletDataRow(key=data_key, value=data_value)
+                        wallet_data_table.upsert([data_row]) # Upsert within the context
+                        
+                        # REGISTER THIS TRANSACTION IN THE STANDARD HISTORY
+                        # This ensures it appears in standard transaction listings
+                        # Pass event_data which includes the safe_amount we calculated
+                        self._register_transaction_for_key(txid, key_id, event_data)
+                
+                # Save the updated transaction counts and balances to the database
+                try:
+                    self._save_mnee_data_to_db() # This method now also uses context manager
+                except Exception as e:
+                    logger.warning(f"Error saving MNEE data after storing token metadata: {str(e)}")
+                    
+                # Only need the fallback sync_state registration if register_transaction_for_key failed
+                if hasattr(self, '_sync_state'):
+                    key_ids = list(address_to_key_map.values())
+                    
+                    # This is now handled by _register_transaction_for_key, but keep as fallback
+                    try:
+                        if hasattr(self._sync_state, 'set_transaction_key_ids'):
+                            self._sync_state.set_transaction_key_ids(txid, key_ids)
+                    except Exception as sync_error:
+                        logger.debug(f"Error updating sync state: {str(sync_error)}")
+                
+                logger.info(f"Stored MNEE token metadata for transaction {txid[:10]} with {len(address_to_key_map)} addresses using standard ESV patterns")
+            else:
+                logger.error(f"Cannot store MNEE token metadata: wallet has no db_context getter")
+        except Exception as e:
+            logger.error(f"Error processing transaction {txid[:10]}...: {str(e)}")
+                
+        return
+    

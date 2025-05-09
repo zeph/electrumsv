@@ -109,6 +109,7 @@ class HistoryLine(NamedTuple):
     tx_flags: TxFlags
     height: Optional[int]
     value_delta: int
+    mnee_amount: Optional[int] # Added MNEE amount
 
 
 @attr.s(slots=True, hash=False)
@@ -1195,8 +1196,11 @@ class AbstractAccount:
                 sort_key = (height, metadata.date_added)
             else:
                 sort_key = (1e9, metadata.date_added)
+            
+            # The row object is a TransactionDeltaHistoryRow and already has mnee_delta
+            # No need to parse metadata here as previously attempted.
             history_raw.append(HistoryLine(sort_key, row.tx_hash, row.tx_flags, height,
-                row.value_delta))
+                row.value_delta, row.mnee_delta))
 
         history_raw.sort(key = lambda v: v.sort_key)
 
@@ -1377,12 +1381,19 @@ class AbstractAccount:
     def stop(self) -> None:
         assert not self._stopped
         self._stopped = True
-
+        
         self._logger.debug(f'stopping account %s', self)
         if self._network:
             self._network.remove_account(self)
             self._network = None
-
+        
+    def close(self) -> None:
+        """
+        Override this method to clean up database connections and other resources
+        when the wallet is being closed. This is called after stop().
+        """
+        pass
+        
     def can_export(self) -> bool:
         if self.is_watching_only():
             return False
@@ -2946,7 +2957,12 @@ class Wallet(TriggeredCallbacks):
         self._storage.put('last_tip_hash', chain_tip_hash.hex() if chain_tip_hash else None)
 
         for account in self.get_accounts():
+            # First stop the account network operations
             account.stop()
+            # Then close any database connections (particularly important for MNEE accounts)
+            if hasattr(account, 'close'):
+                account.close()
+                
         if self._network is not None:
             self._network.remove_wallet(self)
         if self._transaction_table is not None:
