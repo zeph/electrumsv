@@ -1236,9 +1236,8 @@ class MneeAccount(StandardAccount):
             
             logger.debug(f"Processing {len(addresses)} total addresses in batches of {batch_size}")
             
-            all_transactions_found = 0
+            # Only need to track addresses with transactions
             addresses_with_tx = 0
-            tokens_found = 0
             
             for i in range(0, len(addresses), batch_size):
                 batch_addresses = addresses[i:i+batch_size]
@@ -1301,15 +1300,34 @@ class MneeAccount(StandardAccount):
                                     else:
                                         logger.error(f"Final validation caught invalid txid: {txid[:64] if isinstance(txid, str) else str(txid)[:64]}...")
                                 
-                                # Process the transactions for this key using our improved method with validated txids
+                                # Process the transactions for this key
                                 if final_valid_txids:
-                                    mnee_txs = self.process_mnee_transactions(key_id, final_valid_txids)
-                                    tx_count = len(mnee_txs)
-                                    all_transactions_found += tx_count
-                                    tokens_found += tx_count
-                                    result['mnee_transactions_found'] += tx_count
+                                    # Update transaction count for this key
+                                    current_count = self._mnee_tx_count_per_key.get(key_id, 0)
+                                    self._mnee_tx_count_per_key[key_id] = current_count + len(final_valid_txids)
                                     
-                                    logger.debug(f"Found {tx_count} MNEE tokens for address {address[:10]}...")
+                                    # Record transactions in database and increment counters
+                                    for txid in final_valid_txids:
+                                        try:
+                                            # Create a record in the database
+                                            if hasattr(self._wallet, 'get_db_context'):
+                                                db_context = self._wallet.get_db_context()
+                                                wallet_data_table = WalletDataTable(db_context)
+                                                
+                                                data_key = f"mnee_tx_processed_{txid[:8]}_{key_id}"
+                                                data_value = json.dumps({
+                                                    'txid': txid,
+                                                    'key_id': key_id,
+                                                    'processed_time': int(time.time())
+                                                })
+                                                data_row = WalletDataRow(key=data_key, value=data_value)
+                                                wallet_data_table.upsert([data_row])
+                                        except Exception as e:
+                                            logger.error(f"Error recording transaction {txid[:8]} for key {key_id}: {str(e)}")
+                                    
+                                    # Update the counter in result
+                                    result['mnee_transactions_found'] += len(final_valid_txids)
+                                    logger.debug(f"Found {len(final_valid_txids)} MNEE transactions for address {address[:10]}...")
                                 else:
                                     logger.warning(f"All transaction IDs for address {address} were invalid after final validation")
             
@@ -1318,10 +1336,8 @@ class MneeAccount(StandardAccount):
                     result['errors'].append(error_msg)
                     logger.error(error_msg)
             
-            # Update final results
-            result['mnee_transactions_found'] = all_transactions_found
+            # Only keep non-redundant address tracking - transaction counts already updated inline
             result['addresses_with_transactions'] = addresses_with_tx
-            result['tokens_found'] = tokens_found
         
         # Calculate token balance changes
         final_token_balances = {}
@@ -1374,9 +1390,9 @@ class MneeAccount(StandardAccount):
         # Log final results summary
         logger.debug(f"MNEE sync completed for account {self.get_id()}")
         logger.debug(f"Results: {result['mnee_api_calls']} API calls, " + 
-                    f"{result['tokens_found']} tokens found, " +
-                    f"{result['directly_stored_transactions']} transactions directly stored, " +
-                    f"across {result.get('addresses_with_transactions', 0)}/{result['address_count']} addresses")
+                   f"{result['mnee_transactions_found']} transactions found, " +
+                   f"{result['directly_stored_transactions']} transactions directly stored, " +
+                   f"across {result.get('addresses_with_transactions', 0)}/{result['address_count']} addresses")
         
         # Final balance summary
         if total_final_balance > 0:
@@ -1614,58 +1630,3 @@ class MneeAccount(StandardAccount):
 
         logger.debug(f"MneeAccount: tx {tx_id} not relevant to account {self.get_id()} after processing.")
         return False
-
-    def process_mnee_transactions(self, key_id: int, txids: List[str]) -> List[Dict]:
-        """
-        Process a list of transaction IDs for a specific key.
-        This method updates the token counts for a key and returns a list of processed transactions.
-        
-        Args:
-            key_id: The keyinstance_id to update with transaction counts
-            txids: List of transaction IDs to process
-            
-        Returns:
-            List of processed transaction data dictionaries
-        """
-        logger.debug(f"Processing {len(txids)} MNEE transactions for key {key_id}")
-        
-        if not txids:
-            return []
-            
-        # Update the transaction count for this key
-        current_count = self._mnee_tx_count_per_key.get(key_id, 0)
-        new_count = current_count + len(txids)
-        self._mnee_tx_count_per_key[key_id] = new_count
-        
-        # Process each transaction
-        processed_txs = []
-        for txid in txids:
-            try:
-                # Create a transaction data entry
-                tx_data = {
-                    'txid': txid,
-                    'key_id': key_id,
-                    'processed_time': int(time.time())
-                }
-                
-                # Add to the processed list
-                processed_txs.append(tx_data)
-                
-                # Make sure to save the data to the database
-                if hasattr(self._wallet, 'get_db_context'):
-                    db_context = self._wallet.get_db_context()
-                    wallet_data_table = WalletDataTable(db_context)
-                    
-                    # Create a record of this transaction being processed
-                    data_key = f"mnee_tx_processed_{txid[:8]}_{key_id}"
-                    data_value = json.dumps(tx_data)
-                    data_row = WalletDataRow(key=data_key, value=data_value)
-                    wallet_data_table.upsert([data_row])
-            except Exception as e:
-                logger.error(f"Error processing MNEE transaction {txid[:8]} for key {key_id}: {str(e)}")
-        
-        # Save the transaction count back to the database
-        self._save_mnee_data_to_db()
-        
-        # Return the list of processed transactions
-        return processed_txs
